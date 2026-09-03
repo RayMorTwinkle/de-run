@@ -1,0 +1,23 @@
+<svg viewBox="0 0 160 160" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">
+  <title>de-run</title>
+  <defs>
+    <linearGradient id="bg-black" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#27272A" />
+      <stop offset="100%" stop-color="#09090B" />
+    </linearGradient>
+    <filter id="shadow-b" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.5" />
+    </filter>
+  </defs>
+
+  <rect x="30" y="30" width="100" height="100" rx="22.5" fill="url(#bg-black)" filter="url(#shadow-b)" />
+  <rect x="30" y="30" width="100" height="100" rx="22.5" fill="none" stroke="#3F3F46" stroke-width="1" />
+  <rect x="31" y="31" width="98" height="98" rx="21.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.05" stroke-width="1" />
+
+  <g transform="translate(44.0, 44.0) scale(3.0)">
+<circle cx="9.5" cy="12" r="5.8" fill="none" stroke="#FFFFFF" stroke-width="3" />
+  <rect x="17" y="6.4" width="4.6" height="2.2" fill="#9DBCF7" />
+  <rect x="17" y="10.9" width="5.6" height="2.2" fill="#6C9BF7" />
+  <rect x="17" y="15.4" width="4.6" height="2.2" fill="#0A59F7" />
+  </g>
+</svg>

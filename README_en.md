@@ -2,7 +2,7 @@
 
 > English | [简体中文](./README.md)
 
-<!-- Icon placeholder: add <img src="de-run.svg" alt="de-run" width="320"> here once de-run.svg is ready -->
+<img src="de-run.svg" alt="de-run" width="320">
 
 # de-run — Huawei DevEco Code as sub-agents for any harness
 
@@ -164,6 +164,7 @@ de-run/                      # repo name; rename to de-run-subagent when install
 ├── README.md                # Chinese readme (primary)
 ├── README_en.md             # English readme
 ├── LICENSE                  # MIT
+├── de-run.svg               # icon
 ├── scripts/
 │   └── de-run.py            # main script (pure Python stdlib, zero deps)
 └── examples/

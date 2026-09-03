@@ -2,7 +2,7 @@
 
 > [English](./README_en.md) | 简体中文
 
-<!-- 图标占位：后续加入 de-run.svg 后，在此处添加 <img src="de-run.svg" alt="de-run" width="320"> -->
+<img src="de-run.svg" alt="de-run" width="320">
 
 # de-run — 把华为 DevEco Code 变成任意 Harness 的子 Agent
 
@@ -167,6 +167,7 @@ de-run/                      # 仓库名；作为 skill 安装时重命名为 de
 ├── README.md                # 简体中文说明文件（主文档）
 ├── README_en.md             # 英文说明文件
 ├── LICENSE                  # MIT
+├── de-run.svg               # 图标
 ├── scripts/
 │   └── de-run.py            # 主脚本（纯 Python 标准库，零依赖）
 └── examples/
