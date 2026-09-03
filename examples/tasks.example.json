@@ -1,0 +1,8 @@
+{
+  "tasks": [
+    {"dir": "/path/to/projectA", "prompt": "分析项目A的技术栈、核心功能、目录结构，用中文输出", "title": "A 分析"},
+    {"dir": "/path/to/projectB", "prompt": "列出项目B的主要文件清单", "title": "B 文件清单"},
+    {"dir": "/path/to/harmonyos-project", "prompt": "运行 ArkTS 语法检查，修复发现的错误，回报：修复项+构建产物路径+未解决项", "title": "C 鸿蒙构建"},
+    {"dir": "/path/to/docs", "prompt": "阅读该目录下全部文档，回报：核心结论+来源文件+未确认项", "title": "D 资料调研"}
+  ]
+}
