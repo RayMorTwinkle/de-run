@@ -110,8 +110,8 @@ ZCode / Claude Code 的后台任务机制，完成自动通知）
   --dangerously-skip-permissions）；只读分析类任务请勿让 agent 修改文件
 - 需要 `deveco auth login` 已完成（凭据存 ~/.local/share/deveco/auth.json）；
   未登录时 deveco run 会直接失败
-- （可选）编译/运行鸿蒙工程：安装 HarmonyOS Command Line Tools 并设置
-  DEVECO_CLI_CLT_PATH 环境变量，子 Agent 会自行调用 devecocli 完成构建
+- （可选）编译/运行鸿蒙工程：安装 DevEco Studio ≥6.1（装 /Applications 自动识别，
+  或设 DEVECO_HOME 指向安装目录），子 Agent 会自行调用内置工具完成构建
 - 单个任务失败（目录不存在 / 超时 / deveco 报错）不影响其他任务
 - 汇总字段: session ID / 动作统计（按工具名）/ 最终文本 / tokens
 """

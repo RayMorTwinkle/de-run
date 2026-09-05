@@ -57,13 +57,13 @@ de-run --dir /path/A --prompt "..." --json
 
 ## 鸿蒙开发场景（可选增强）
 
-子 Agent 继承 deveco 的全部鸿蒙能力。若需编译/运行鸿蒙工程，给子 Agent 环境装好 HarmonyOS Command Line Tools 并设置 `DEVECO_CLI_CLT_PATH`，然后直接下任务：
+子 Agent 继承 deveco 的全部鸿蒙能力。若需编译/运行鸿蒙工程，给子 Agent 环境装好 [DevEco Studio](https://developer.huawei.com/consumer/cn/download/deveco-studio)（≥6.1，deveco-code 的硬性要求；装在 /Applications 可自动识别，或设 `DEVECO_HOME` 指向安装目录），然后直接下任务：
 
 ```bash
 de-run --dir /path/to/harmonyos-project --prompt "检查 ArkTS 语法错误并修复，然后编译出 HAP 产物，回报产物路径"
 ```
 
-子 Agent 会自行调用 deveco 内置的 `arkts_check` / `build_project` / `start_app` 等工具，或使用 `devecocli` 命令行（create/build/docs/skills/emulator）。
+子 Agent 会自行调用 deveco 内置的 `arkts_check` / `build_project` / `start_app` 等工具，或使用 deveco 内嵌命令行（create/build/docs/skills/emulator 全套）。
 
 ## 从 LLM / Agent 中调用
 

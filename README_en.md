@@ -40,7 +40,7 @@ Sibling project: [oc-run](https://github.com/RayMorTwinkle/oc-run) (OpenCode as 
 - 🔁 **Multi-round iteration**: `--session` keeps a sub-agent's memory; loop until the report is good enough
 - 📊 **Auto summary**: session ID, tool action counts, final report and tokens per sub-agent
 - 🔎 **Cross-project history**: `--sessions` lists sessions from all projects (reads deveco's SQLite directly)
-- 🏗️ **Official HarmonyOS toolchain**: sub-agents natively use `arkts_check`, `build_project`, `start_app`, `hdc_log`, `verify_ui`, and `devecocli` (create/build/docs/signature/emulator)
+- 🏗️ **Official HarmonyOS toolchain**: sub-agents natively use `arkts_check`, `build_project`, `start_app`, `hdc_log`, `verify_ui` (requires DevEco Studio ≥6.1; auto-detected when installed under /Applications)
 - 🧩 **Runs anywhere**: built-in binary discovery works even with a minimal PATH (cron / scripts / agent subprocesses)
 
 ## 🔧 Install
@@ -115,7 +115,7 @@ Full options: `de-run --help` (LLM-oriented usage guide in Chinese).
 
 ## 🏗️ HarmonyOS development
 
-Sub-agents inherit deveco's full HarmonyOS capabilities. Install the [HarmonyOS Command Line Tools](https://developer.huawei.com/consumer/cn/download/command-line-tools-for-hmos) and set `DEVECO_CLI_CLT_PATH`, then:
+Sub-agents inherit deveco's full HarmonyOS capabilities. Install [DevEco Studio](https://developer.huawei.com/consumer/cn/download/deveco-studio) (≥6.1; auto-detected under /Applications, or set `DEVECO_HOME` to the install directory), then:
 
 ```bash
 # Syntax check + fix + build in one shot

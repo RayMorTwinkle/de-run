@@ -40,7 +40,7 @@ de-run 是一层薄薄的适配器：给出若干"工作区目录 + 提示词"�
 - 🔁 **多轮迭代**：`--session` 续跑同一子 Agent，保持它的记忆，按报告循环指挥直到达标
 - 📊 **自动汇总**：每个子 Agent 的 session ID、动作次数（按工具分组）、最终报告、tokens，一目了然
 - 🔎 **跨项目历史**：`--sessions` 列出所有项目的 session（直读 deveco 的 SQLite）
-- 🏗️ **鸿蒙官方工具链**：子 Agent 天然会 `arkts_check`、`build_project`、`start_app`、`hdc_log`、`verify_ui`，也能调 `devecocli`（工程创建/编译/离线文档/签名/模拟器）
+- 🏗️ **鸿蒙官方工具链**：子 Agent 天然会 `arkts_check`、`build_project`、`start_app`、`hdc_log`、`verify_ui`（需 DevEco Studio ≥6.1，装在 /Applications 自动识别）
 - 🧩 **任意环境可跑**：内置探测，PATH 精简环境（cron / 脚本 / Agent 子进程）也能找到 deveco
 
 ## 🔧 安装
@@ -70,7 +70,7 @@ de-run 是一层薄薄的适配器：给出若干"工作区目录 + 提示词"�
 5. 验证命令：de-run --help 应输出中文使用说明；若 PATH 里没有，用 python3 ~/.agents/skills/de-run-subagent/scripts/de-run.py --help。
 6. 端到端测试：de-run --sessions 3 应列出最近 3 个 session（跨所有项目）。
 7. 向用户确认安装成功，并简述 de-run 的能力：并行派活 / 续跑（--session）/ 跨项目历史（--sessions）/
-   免费 GLM-5.1（50 次/分钟）/ 鸿蒙开发能力（可选，需 HarmonyOS Command Line Tools）。
+   免费 GLM-5.1（50 次/分钟）/ 鸿蒙开发能力（可选，需 DevEco Studio ≥6.1）。
 ````
 
 ### 面向人类用户
@@ -115,7 +115,7 @@ de-run --dir /path/A --prompt "..." --json
 
 ## 🏗️ 鸿蒙开发场景
 
-deveco 是华为鸿蒙官方 AI Agent，子 Agent 继承其全部鸿蒙能力。给子 Agent 环境装好 [HarmonyOS Command Line Tools](https://developer.huawei.com/consumer/cn/download/command-line-tools-for-hmos) 并设置 `DEVECO_CLI_CLT_PATH` 后：
+deveco 是华为鸿蒙官方 AI Agent，子 Agent 继承其全部鸿蒙能力。给子 Agent 环境装好 [DevEco Studio](https://developer.huawei.com/consumer/cn/download/deveco-studio)（≥6.1；装在 /Applications 自动识别，或设 `DEVECO_HOME` 指向安装目录）后：
 
 ```bash
 # 语法检查 + 修复 + 编译一条龙
