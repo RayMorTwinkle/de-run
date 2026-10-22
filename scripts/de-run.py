@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""
-de-run — deveco (DevEco Code) 中转站（批量并行调度 + 结果汇总）
-
-把若干"工作区目录 + 提示词"任务并行交给 deveco CLI（华为 DevEco Code，
-基于 OpenCode 扩展）执行，全部结束后自动解析 deveco 输出的 JSONL 事件流，
-汇总每个 Agent 的 session ID、动作次数、最终结果与 tokens 消耗。
-
-由 oc-run 移植而来（opencode → deveco），事件流 schema 与 opencode 完全一致。
-前置条件: 已安装 @deveco/deveco-code 并完成 `deveco auth login`（华为账号，
-登录后免费用 deveco/GLM-5.1，单账号 50 次/分钟——并行时注意限速）。
-
-无参数运行或 --help 输出详细使用说明（面向大模型）。
-纯 Python 标准库，零第三方依赖。
-"""
-
+"""Durable, asynchronous DevEco task control. Python standard library only."""
 import argparse
-import glob
+import base64
+from collections import Counter
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import signal
@@ -25,614 +16,795 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
+import traceback
+import urllib.error
+import urllib.parse
 import urllib.request
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
 
-PROG = "de-run"
-DEFAULT_MAX_PARALLEL = 6
-MAX_PARALLEL_LIMIT = 6
-DEFAULT_TIMEOUT = 900
+MAX_PARALLEL = 6
+TERMINAL = {'ok', 'failed', 'incomplete', 'cancelled', 'timeout', 'orphaned'}
+HELP = '''de-run — 异步 DevEco 子 Agent 调度（需要提供 /doc API 的 DevEco）
 
-HELP = f"""de-run — 主 Agent 与 deveco 子 Agent 之间的调度接口
-=====================================================
+  de-run [start|run] --dir PATH --prompt TEXT [--json]
+      默认后台启动，立即返回 run_id 和 task_id；可重复 --dir/--prompt。
+  de-run wait ID [--timeout SEC] [--json]
+      阻塞等待一个 task 或整批 run；超时只停止等待，不取消任务。
+  de-run status ID [--json]
+      查询持久化状态、session、工具动作和最新文本。
+  de-run list [--active] [--recent N] [--run RUN_ID] [--json]
+      列出所有活跃任务、待处理异常，以及最近结束的 10 个任务。
+      默认只突出 task ID；--verbose 显示底层 session ID。
+  de-run send TASK_ID TEXT [--queue] [--json]
+      默认中止当前轮，确认停止后在同一 session 发新指令。
+      --queue 保留当前轮，结束后追加执行。返回控制命令的接收确认。
+  de-run cancel TASK_ID [--json]
+      取消排队或运行中的任务；确认停止后返回。不会回滚已写文件。
+  de-run result ID [--json] [--truncate N]
+      获取报告、错误和各轮历史；任务未结束时退出码为 2。
+  de-run --sessions [N] [--json]
+      只读列出 DevEco 的历史 session。
 
-你给出若干"工作区目录 + 提示词"，de-run 并行派发给独立子 Agent（deveco），
-完成后返回结构化汇总（每个子 Agent 的 session、动作次数、最终报告）。
-子 Agent 的搜索、读码、思考都在隔离环境完成，不占你的上下文；
-也支持 --session 续跑同一子 Agent，保持它的记忆做多轮迭代。
+启动选项：
+  --tasks FILE          JSON 数组或 {"tasks": [...]}，每项 dir/prompt/title/session
+  --session SES_ID      续跑已有 session；工作目录必须与 session 一致
+  --model PROVIDER/MODEL
+  --max-parallel N      默认 6，上限 6（每一批次）
+  --timeout SEC         每轮执行上限，默认 900 秒；超时主动 abort
+  --wait                启动后阻塞，便于迁移原先的调用方式
+  --json                机器可读输出
 
-用法示例
---------
-1) 单个任务（阻塞执行，跑完输出汇总）:
-   {PROG} --dir /path/to/harmonyos-project --prompt "分析这个工程的结构"
-
-2) 多个任务：工作目录与提示词一一对应（主用法，并行度默认 {DEFAULT_MAX_PARALLEL}、上限 {MAX_PARALLEL_LIMIT}）:
-   {PROG} --dir /path/A --prompt "分析项目A" --dir /path/B --prompt "分析项目B"
-   只给 1 个提示词则广播到所有目录: {PROG} --dir A --dir B --prompt "..."
-
-3) 批量任务文件（每个任务自定义 dir / prompt / title）:
-   {PROG} --tasks tasks.json   # 文件为 [{{"dir": "...", "prompt": "...", "title": "..."}}, ...]
-
-4) 接着某个 session 的上下文继续跑（续跑）:
-   {PROG} --sessions                                            # 查看历史 session
-   {PROG} --dir /path/A --session ses_xxx --prompt "继续上次的分析"
-   说明: 续跑经 deveco serve + HTTP API 实现。deveco 0.1.10 的
-   `run --attach` 事件回传有 bug（只吐 step_start）、原生 `--session`
-   会挂起，两者都不可用；HTTP POST /session/:id/message 实测正常。
-   续跑时 --dir 仅用于展示/校验，实际工作目录为 session 原属目录。
-
-推荐用法
---------
-1) token 外包（单轮）——大量读、简洁报:
-   派临时 agent 去读海量资料（鸿蒙文档/代码/日志），回报只要简洁结论+来源。
-   子 agent 独立上下文，读再多也不占你的上下文。
-
-2) 主从循环（多轮）——强模型指挥弱模型:
-   用 --session 续跑同一 agent（保持它的记忆），按每次回报决定下一轮，
-   循环直到结果达标。两条铁律:
-   - 任务描述要详细：agent 没有你的全局视野，prompt 就是它的世界
-   - 回报格式要明确：你只能看到报告/最后发言——回报至少包含
-     结论 + 来源 + 不确定性 + 未完成项 + 关键函数或举措
-
-两种用法均可并行（一次派多个，≤6）、可异步（借宿主环境如
-ZCode / Claude Code 的后台任务机制，完成自动通知）
-
-参数说明
---------
-  --dir <path>        工作区目录，可重复指定
-  --prompt <text>     提示词，可重复指定，与 --dir 按出现顺序一一对应
-                      只给 1 个时广播到所有目录
-  --session <id>      续跑指定 session（可重复；按顺序与前几个任务一一配对，
-                      数量不能超过任务数；不可与 --tasks 同用）
-  --sessions [N]      列出最近 N 个 session（默认 15；传大数如 9999 查全部）
-                      后退出，--json 时输出 JSON
-  --tasks <file>      任务文件（JSON），与 --dir/--prompt 二选一
-  --max-parallel N    最大并行数，默认 {DEFAULT_MAX_PARALLEL}，上限 {MAX_PARALLEL_LIMIT}
-                      ⚠️ deveco/GLM-5.1 免费通道限 50 次/分钟，并行别拉满
-  --model <m>         指定模型，格式 provider/model（默认 deveco/GLM-5.1，
-                      登录华为账号后免费）
-  --timeout <sec>     单个任务超时秒数，默认 {DEFAULT_TIMEOUT}
-  --json              汇总结果输出为 JSON（否则输出人类可读表格）
-  --truncate <n>      人类可读输出中每条结果的最大字符数（默认不截断，
-                      输出全文；给 Agent 消费时建议保持全文）
-
-图片 / 文件输入
-------------
-  读图或附带文件无需额外参数：把文件路径写进提示词即可，子 Agent 会自行读取；
-  也可用 deveco run 原生 -f/--file 传附件。
-
-行为说明
---------
-- 权限自动批准用 deveco 的 --auto（等价 opencode 的
-  --dangerously-skip-permissions）；只读分析类任务请勿让 agent 修改文件
-- 需要 `deveco auth login` 已完成（凭据存 ~/.local/share/deveco/auth.json）；
-  未登录时 deveco run 会直接失败
-- （可选）编译/运行鸿蒙工程：安装 DevEco Studio ≥6.1（装 /Applications 自动识别，
-  或设 DEVECO_HOME 指向安装目录），子 Agent 会自行调用内置工具完成构建
-- 单个任务失败（目录不存在 / 超时 / deveco 报错）不影响其他任务
-- 汇总字段: session ID / 动作统计（按工具名）/ 最终文本 / tokens
-"""
+状态目录：DE_RUN_HOME，默认 ~/.local/share/de-run（私有目录）。
+状态与报告在调用进程退出后仍保留；每批后台 worker 持有 DevEco serve。
+默认自动批准工具权限，与旧版 --auto 一致。没有文件系统隔离或自动回滚。
+支持 macOS/Linux；Windows 的进程与锁实现尚未支持。
+退出码：0 成功；1 失败/取消/不完整；2 参数错误或结果未就绪；124 等待超时。
+'''
 
 
-def parse_args(argv):
-    p = argparse.ArgumentParser(add_help=False, prog=PROG)
-    p.add_argument("--help", "-h", action="store_true", help="显示帮助")
-    p.add_argument("--dir", action="append", default=[], metavar="<path>")
-    p.add_argument("--prompt", action="append", default=[], metavar="<text>")
-    p.add_argument("--session", action="append", default=[], metavar="<session_id>")
-    p.add_argument("--sessions", nargs="?", type=int, const=15, metavar="N",
-                   help="列出最近 N 个 session（默认 15）后退出")
-    p.add_argument("--tasks", metavar="<file.json>")
-    p.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
-    p.add_argument("--model", metavar="<provider/model>")
-    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--truncate", type=int, default=None, metavar="<n>",
-                   help="人类可读输出中每条结果的最大字符数（默认不截断）")
-    return p.parse_args(argv)
+def identifier(prefix):
+    return prefix + uuid.uuid4().hex[:12]
 
 
-def build_tasks(args):
-    """把参数展开为任务列表: [{"dir", "prompt", "title"}]"""
-    tasks = []
-    if args.tasks:
-        if args.dir or args.prompt:
-            sys.exit("错误: --tasks 与 --dir/--prompt 互斥，请二选一。\n")
+def message_identifier():
+    # DevEco sorts conversation IDs lexicographically. Match its ascending 6-byte
+    # timestamp/counter prefix instead of supplying an unordered UUID as messageID.
+    stamp = (int(time.time() * 1000) << 12) & ((1 << 48) - 1)
+    return 'msg_%012x%s' % (stamp, uuid.uuid4().hex[:22])
+
+
+def state_home():
+    p = Path(os.environ.get('DE_RUN_HOME', '~/.local/share/de-run')).expanduser().resolve()
+    p.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return p
+
+
+def run_path(value):
+    m = re.fullmatch(r'(run|task)_([a-f0-9]{12})(?:_([1-9][0-9]*))?', value)
+    if not m or (m[1] == 'task') != bool(m[3]):
+        raise ValueError('ID 应为 start 返回的 run_id 或 task_id')
+    p = state_home() / ('run_' + m[2])
+    if not (p / 'state.db').is_file():
+        raise ValueError('找不到任务: ' + value)
+    return p
+
+
+def connect(p):
+    db = sqlite3.connect(p / 'state.db', timeout=10)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def task_rows(db):
+    return [json.loads(r[0]) for r in db.execute('SELECT data FROM tasks ORDER BY ordinal')]
+
+
+def save_task(db, task):
+    task['updated_at'] = time.time()
+    with db:
+        db.execute('UPDATE tasks SET data=? WHERE id=?',
+                   (json.dumps(task, ensure_ascii=False), task['task_id']))
+
+
+def settings(db):
+    return json.loads(db.execute('SELECT data FROM settings').fetchone()[0])
+
+
+def worker_alive(p):
+    with open(p / 'worker.lock', 'a') as f:
         try:
-            with open(args.tasks, encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            sys.exit(f"错误: 找不到任务文件: {args.tasks}\n")
-        except json.JSONDecodeError as e:
-            sys.exit(f"错误: 任务文件不是合法 JSON（{e}）\n")
-        raw = data.get("tasks", data) if isinstance(data, dict) else data
-        if not isinstance(raw, list):
-            sys.exit("错误: 任务文件需是数组，或 {\"tasks\": [...]} 结构。\n")
-        for i, t in enumerate(raw):
-            if not isinstance(t, dict) or "dir" not in t or "prompt" not in t:
-                sys.exit(f"错误: 任务文件第 {i + 1} 项缺少 dir 或 prompt 字段。\n")
-            tasks.append({
-                "dir": t["dir"],
-                "prompt": t["prompt"],
-                "title": t.get("title") or f"任务{i + 1}",
-            })
-    else:
-        if not args.dir:
-            sys.exit(HELP + "\n\n错误: 至少需要 --dir 或 --tasks 之一。\n")
-        if not args.prompt:
-            sys.exit("错误: 需要至少一个 --prompt 提示词。\n")
-        n_dir, n_prompt = len(args.dir), len(args.prompt)
-        if n_prompt == 1:
-            prompts = args.prompt * n_dir  # 单提示词广播到所有目录
-        elif n_prompt == n_dir:
-            prompts = args.prompt          # 一一对应（主用法）
-        else:
-            sys.exit(
-                f"错误: --dir 有 {n_dir} 个、--prompt 有 {n_prompt} 个，数量不匹配。\n"
-                "需一一对应（两者数量相等），或只给 1 个提示词广播到所有目录。\n")
-        for d, p in zip(args.dir, prompts):
-            tasks.append({
-                "dir": d,
-                "prompt": p,
-                "title": os.path.basename(d.rstrip("/")) or d,
-            })
-    if args.session:
-        if args.tasks:
-            sys.exit("错误: --session 与 --tasks 不能同时使用。\n")
-        if len(args.session) > len(tasks):
-            sys.exit(
-                f"错误: --session 有 {len(args.session)} 个、任务只有 {len(tasks)} 个。\n"
-                "--session 按顺序与前几个任务配对，数量不能超过任务数。\n")
-        for t, sid in zip(tasks, args.session):
-            if not sid.startswith("ses_"):
-                sys.exit(f"错误: session ID 格式不正确（应以 ses_ 开头）: {sid}\n")
-            t["session"] = sid
-    return tasks
-
-
-def parse_events(stdout):
-    """解析 deveco run --format json 输出的 JSONL 事件流，忽略非 JSON 行"""
-    events = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return events
-
-
-def summarize(task, stdout, stderr, returncode):
-    """从一个任务的输出中提取汇总字段（事件 schema 与 opencode 一致）"""
-    events = parse_events(stdout or "")
-    session_id = None
-    actions = Counter()
-    text_parts = []
-    tokens_total = 0
-
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("sessionID"):
-            session_id = session_id or ev["sessionID"]
-        etype = ev.get("type")
-        part = ev.get("part")
-        if not isinstance(part, dict):
-            part = {}
-        if etype == "tool_use":
-            tool = part.get("tool") or "?"
-            actions[tool] += 1
-        elif etype == "text":
-            if part.get("text"):
-                text_parts.append(part["text"])
-        elif etype == "step_finish":
-            tk = part.get("tokens") or {}
-            tokens_total += tk.get("total", 0) or 0
-
-    final_text = (text_parts[-1] if text_parts else "").strip()
-    if returncode == 0 and session_id:
-        status = "ok"
-    else:
-        status = "failed"
-
-    return {
-        "title": task["title"],
-        "dir": task["dir"],
-        "status": status,
-        "session_id": session_id,
-        "actions": dict(actions),
-        "total_actions": sum(actions.values()),
-        "final_result": final_text,
-        "tokens": tokens_total,
-        "exit_code": returncode,
-        "stderr_tail": (stderr or "").strip()[-500:],
-    }
-
-
-def _task_error(task, status, message):
-    """构造失败任务的汇总条目（统一字段结构）"""
-    return {
-        "title": task["title"], "dir": task["dir"], "status": status,
-        "session_id": None, "actions": {}, "total_actions": 0,
-        "final_result": message, "tokens": 0,
-        "exit_code": None, "stderr_tail": "",
-    }
-
-
-def kill_tree(proc):
-    """向进程组发 SIGTERM，连带 deveco 派生的孙进程"""
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
-def run_task(task, model, timeout, serve_url=None):
-    if task.get("session"):
-        # 续跑模式: 直连 serve 的 HTTP API（run --attach 事件回传有 bug，
-        # 原生 --session 挂起，故走 POST /session/:id/message）
-        return resume_via_http(task, model, serve_url, timeout)
-    cmd = [
-        "deveco", "run",
-        "--dir", task["dir"],
-        "--format", "json",
-        "--title", task["title"],
-        "--auto",
-    ]
-    if model:
-        cmd += ["--model", model]
-    cmd.append(task["prompt"])
-
-    try:
-        # start_new_session: 独立进程组，超时后可按组清理孙进程
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True,
-                                errors="replace", start_new_session=True)
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-            return summarize(task, stdout, stderr, proc.returncode)
-        except subprocess.TimeoutExpired:
-            kill_tree(proc)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            return _task_error(task, "timeout", f"超过 {timeout}s 未完成，已终止")
-    except FileNotFoundError:
-        return _task_error(task, "error", "找不到 deveco 命令，请先安装 (npm i -g @deveco/deveco-code)")
-    except Exception as e:
-        # 兜底: 任何异常都不应中断整批任务
-        return _task_error(task, "error", f"执行异常: {e}")
-
-
-# ── deveco serve 生命周期管理（续跑用）────────────────────────────
-
-_serve_proc = None
-_serve_url = None
-_serve_lock = threading.Lock()
-
-
-def find_free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def get_serve():
-    """懒启动一个 headless deveco server，所有续跑任务共用"""
-    global _serve_proc, _serve_url
-    with _serve_lock:
-        # serve 中途崩溃则重置，下次重新启动
-        if _serve_proc is not None and _serve_proc.poll() is not None:
-            _serve_proc = None
-            _serve_url = None
-        if _serve_proc is None:
-            port = find_free_port()
-            _serve_proc = subprocess.Popen(
-                ["deveco", "serve", "--port", str(port), "--print-logs"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
-            url = f"http://localhost:{port}"
-            ok = False
-            for _ in range(30):
-                if _serve_proc.poll() is not None:
-                    break  # serve 进程提前退出 = 启动失败
-                try:
-                    # /health 返回 200（HTML 页）即视为就绪
-                    urllib.request.urlopen(url + "/health", timeout=2)
-                    ok = True
-                    break
-                except Exception:
-                    time.sleep(1)
-            if not ok:
-                code = _serve_proc.poll()
-                kill_tree(_serve_proc)
-                _serve_proc = None
-                raise RuntimeError(
-                    f"deveco serve 启动失败（进程退出 exit={code}，或 30s 未就绪）")
-            _serve_url = url
-    return _serve_url
-
-
-def stop_serve():
-    global _serve_proc, _serve_url
-    if _serve_proc is not None:
-        kill_tree(_serve_proc)
-        try:
-            _serve_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(_serve_proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-        _serve_proc = None
-        _serve_url = None
-
-
-# ── 续跑：直连 serve 的 HTTP API（run --attach 事件回传有 bug）────
-
-DEFAULT_RESUME_MODEL = "deveco/GLM-5.1"
-
-
-def resume_via_http(task, model, serve_url, timeout):
-    """POST /session/:id/message 完成续跑，返回与 summarize() 同构的汇总。
-
-    响应为单个 JSON: {info: {sessionID, tokens, finish, ...}, parts: [...]}，
-    parts 内 text / tool 部件分别对应文本与动作统计。
-    """
-    if model:
-        provider_id, _, model_id = model.partition("/")
-        if not model_id:
-            provider_id, model_id = "deveco", model
-    else:
-        provider_id, model_id = DEFAULT_RESUME_MODEL.split("/", 1)
-    body = json.dumps({
-        "providerID": provider_id,
-        "modelID": model_id,
-        "parts": [{"type": "text", "text": task["prompt"]}],
-    }).encode("utf-8")
-
-    result = _task_error(task, "failed", "")
-    actions = Counter()
-    text_parts = []
-    try:
-        req = urllib.request.Request(
-            f"{serve_url}/session/{task['session']}/message",
-            data=body, headers={"Content-Type": "application/json"},
-            method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="replace")[-300:]
-        except Exception:
-            pass
-        result["final_result"] = f"HTTP {e.code}: {detail or e.reason}"
-        return result
-    except Exception as e:
-        result["final_result"] = f"执行异常: {e}"
-        return result
-
-    info = data.get("info") or {}
-    for part in data.get("parts") or []:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
-        if ptype == "text" and part.get("text"):
-            text_parts.append(part["text"])
-        elif ptype == "tool":
-            actions[part.get("tool") or part.get("name") or "?"] += 1
-
-    result["status"] = "ok" if (info.get("sessionID")
-                                and info.get("finish") in ("stop", "length",
-                                                           "tool-calls")) else "failed"
-    result["session_id"] = info.get("sessionID") or task["session"]
-    result["actions"] = dict(actions)
-    result["total_actions"] = sum(actions.values())
-    result["final_result"] = (text_parts[-1] if text_parts else "").strip()
-    result["tokens"] = (info.get("tokens") or {}).get("total", 0) or 0
-    return result
-
-
-# ── session 历史（--sessions）──────────────────────────────────────
-
-def format_ts(ms):
-    """epoch 毫秒 → 本地时间 MM-DD HH:MM"""
-    try:
-        return time.strftime("%m-%d %H:%M", time.localtime(ms / 1000))
-    except (TypeError, ValueError, OSError):
-        return str(ms)
-
-
-def deveco_db_path():
-    """优先问 deveco 本身，失败则用默认路径"""
-    try:
-        p = subprocess.run(["deveco", "db", "path"], capture_output=True,
-                           text=True, timeout=30)
-        path = p.stdout.strip()
-        if p.returncode == 0 and path and os.path.isfile(path):
-            return path
-    except Exception:
-        pass
-    return os.path.expanduser("~/.local/share/deveco/deveco.db")
-
-
-def list_sessions(n):
-    """列出最近 n 个 session（只读方式直查 deveco.db SQLite）。
-
-    deveco db 子命令无 --format json（表格输出难解析），故直接用
-    python sqlite3 只读打开。deveco.db 与 opencode 的 opencode.db
-    schema 不同：无 project/worktree 关联表，session.directory 即工作目录。
-    """
-    n = max(0, min(n, 10000))
-    db_path = deveco_db_path()
-    if not os.path.isfile(db_path):
-        print(f"警告: 找到不到 deveco 数据库: {db_path}", file=sys.stderr)
-        return []
-    query = (
-        "SELECT id, title, directory, time_updated, model "
-        "FROM session WHERE time_archived IS NULL "
-        f"ORDER BY time_updated DESC LIMIT {n}"
-    )
-    items = []
-    try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
-        try:
-            rows = con.execute(query).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error as e:
-        print(f"警告: deveco.db 查询失败（{e}）", file=sys.stderr)
-        return []
-    for r in rows:
-        model = None
-        if r[4]:
-            try:
-                model = json.loads(r[4]).get("id")
-            except Exception:
-                model = r[4]
-        items.append({
-            "session_id": r[0],
-            "title": r[1] or "(无标题)",
-            "worktree": r[2] or "/",
-            "updated": format_ts(r[3]),
-            "model": model,
-        })
-    return items
-
-
-def print_sessions(items, as_json=False):
-    if as_json:
-        print(json.dumps(items, ensure_ascii=False, indent=2))
-        return
-    print(f"de-run 历史 session（最近 {len(items)} 条，deveco 全部项目）")
-    for i, it in enumerate(items, 1):
-        model = f" · {it['model']}" if it.get("model") else ""
-        print(f"  [{i}] {it['session_id']}  {it['title']}{model}")
-        print(f"       {it['updated']}  {it['worktree']}")
-    print()
-    print('续跑方法: de-run --dir <目录> --session <session_id> --prompt "继续..."')
-
-
-def truncate(text, n=200):
-    text = " ".join(text.split())
-    if n <= 1:  # 非法截断长度：直接返回原文
-        return text
-    return text if len(text) <= n else text[: n - 1] + "…"
-
-
-def print_human(results, workers, truncate_n=None):
-    n_ok = sum(1 for r in results if r["status"] == "ok")
-    print(f"de-run 汇总 · {len(results)} 个任务 · 并行度 {workers} · 成功 {n_ok}/{len(results)}")
-    print("─" * 72)
-    icons = {"ok": "✅", "failed": "❌", "timeout": "⏱", "error": "⚠️"}
-    for i, r in enumerate(results, 1):
-        icon = icons.get(r["status"], "·")
-        print(f"{icon} [{i}] {r['title']}")
-        print(f"    session: {r['session_id'] or '(无)'}")
-        acts = " · ".join(f"{k}×{v}" for k, v in sorted(r["actions"].items())) or "(无工具调用)"
-        print(f"    动作:   {r['total_actions']} 次 ({acts})")
-        print(f"    tokens: {r['tokens']:,}")
-        if r["status"] == "ok":
-            res = r["final_result"] if not truncate_n else truncate(r["final_result"], truncate_n)
-            print(f"    结果:   {res if res else '(无文本输出)'}")
-        else:
-            detail = r["final_result"] or r["stderr_tail"] or "未知错误"
-            print(f"    错误:   {truncate(detail, 160)}")
-        print()
-
-
-def ensure_deveco():
-    """确保 subprocess 能找到 deveco。
-
-    环境 PATH 精简时（非交互 shell / 脚本 / cron），`which deveco`
-    可能落空；按常见安装路径探测，命中后把所在目录注入 PATH。
-    os.path.isfile 会自动过滤悬空软链（目标不存在返回 False）。
-    """
-    if shutil.which("deveco"):
-        return True
-    for pat in (
-        "~/.npm-global/bin",
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "~/.local/bin",
-        "~/.bun/bin",
-    ):
-        for d in glob.glob(os.path.expanduser(pat)):
-            cand = os.path.join(d, "deveco")
-            if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
-                return True
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(f, fcntl.LOCK_UN)
     return False
 
 
-def main():
-    args = parse_args(sys.argv[1:])
-    if args.help:
-        print(HELP)
-        return 0
+def spawn_worker(p):
+    if worker_alive(p):
+        return
+    with open(p / 'worker.log', 'ab', buffering=0) as log:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_worker', p.name],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, close_fds=True)
 
-    if not ensure_deveco():
-        sys.exit("错误: 未找到 deveco 命令，请先安装 (npm i -g @deveco/deveco-code)。")
 
-    if args.sessions is not None:
-        print_sessions(list_sessions(args.sessions), as_json=args.json)
-        return 0
+def ensure_deveco():
+    found = shutil.which('deveco')
+    if found:
+        return found
+    for directory in ('~/.npm-global/bin', '/opt/homebrew/bin', '/usr/local/bin',
+                      '~/.local/bin', '~/.bun/bin'):
+        candidate = Path(directory).expanduser() / 'deveco'
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            os.environ['PATH'] = str(candidate.parent) + os.pathsep + os.environ.get('PATH', '')
+            return str(candidate)
+    raise ValueError('未找到 deveco，请安装并完成 deveco auth login')
 
-    tasks = build_tasks(args)
-    if not tasks:
-        sys.exit("错误: 没有可执行的任务。\n")
-    if args.max_parallel < 1:
-        sys.exit("错误: --max-parallel 至少为 1。\n")
-    if args.max_parallel > MAX_PARALLEL_LIMIT:
-        print(f"警告: --max-parallel 超过上限 {MAX_PARALLEL_LIMIT}，已按上限执行", file=sys.stderr)
-    if args.timeout < 1:
-        sys.exit("错误: --timeout 至少为 1 秒。\n")
-    workers = min(args.max_parallel, MAX_PARALLEL_LIMIT, len(tasks))
 
-    serve_url = None
-    if any(t.get("session") for t in tasks):
-        try:
-            serve_url = get_serve()
-        except RuntimeError as e:
-            sys.exit(f"错误: {e}")
-
-    t0 = time.time()
-    results = [None] * len(tasks)
-    try:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(run_task, t, args.model, args.timeout, serve_url): i
-                       for i, t in enumerate(tasks)}
-            for fut in as_completed(futures):
-                results[futures[fut]] = fut.result()
-    finally:
-        stop_serve()
-    elapsed = time.time() - t0
-
-    if args.json:
-        print(json.dumps({
-            "summary": {
-                "total": len(results),
-                "parallel": workers,
-                "ok": sum(1 for r in results if r["status"] == "ok"),
-                "elapsed_sec": round(elapsed, 1),
-            },
-            "tasks": results,
-        }, ensure_ascii=False, indent=2))
+def build_tasks(args):
+    if args.tasks:
+        if args.dir or args.prompt or args.session:
+            raise ValueError('--tasks 不可与 --dir/--prompt/--session 混用；session 可写在 JSON 每项内')
+        data = json.loads(Path(args.tasks).read_text(encoding='utf-8'))
+        raw = data.get('tasks') if isinstance(data, dict) else data
+        if not isinstance(raw, list) or not raw:
+            raise ValueError('任务文件必须是非空数组或 {"tasks": [...]}')
     else:
-        print_human(results, workers, args.truncate)
-        print(f"总耗时: {elapsed:.1f}s")
+        if not args.dir or not args.prompt:
+            raise ValueError('至少提供 --dir 和 --prompt，或 --tasks')
+        if len(args.prompt) not in (1, len(args.dir)):
+            raise ValueError('--prompt 应为一个广播提示词，或与 --dir 数量一致')
+        prompts = args.prompt * len(args.dir) if len(args.prompt) == 1 else args.prompt
+        raw = [dict(dir=d, prompt=p) for d, p in zip(args.dir, prompts)]
+        if len(args.session) > len(raw):
+            raise ValueError('--session 数量不可超过任务数量')
+        for task, sid in zip(raw, args.session):
+            task['session'] = sid
+    tasks, seen = [], set()
+    for t in raw:
+        if not isinstance(t, dict) or not isinstance(t.get('dir'), str) or not isinstance(t.get('prompt'), str) or not t['prompt'].strip():
+            raise ValueError('每项需要字符串 dir 和非空 prompt')
+        directory = Path(t['dir']).expanduser().resolve()
+        if not directory.is_dir():
+            raise ValueError('工作目录不存在: ' + str(directory))
+        sid = t.get('session')
+        if sid and (not isinstance(sid, str) or not re.fullmatch(r'ses_[a-zA-Z0-9]+', sid)):
+            raise ValueError('session ID 格式不正确')
+        if sid and sid in seen:
+            raise ValueError('同一批次不可同时调度相同 session')
+        seen.add(sid)
+        tasks.append(dict(dir=str(directory), prompt=t['prompt'],
+                          title=str(t.get('title') or directory.name), session_id=sid))
+    return tasks
+
+
+def start(args):
+    ensure_deveco()
+    tasks = build_tasks(args)
+    if args.max_parallel < 1 or args.timeout < 1:
+        raise ValueError('并行度与执行超时必须大于 0')
+    if args.max_parallel > MAX_PARALLEL:
+        print('警告: 并行度已限制为 6', file=sys.stderr)
+    if args.model and ('/' not in args.model or not all(args.model.split('/', 1))):
+        raise ValueError('--model 需要 provider/model')
+    rid = identifier('run_')
+    p = state_home() / rid
+    p.mkdir(mode=0o700)
+    with connect(p) as db:
+        db.executescript('''
+            CREATE TABLE settings(data TEXT NOT NULL);
+            CREATE TABLE tasks(id TEXT PRIMARY KEY, ordinal INTEGER, data TEXT NOT NULL);
+            CREATE TABLE commands(id TEXT PRIMARY KEY, task_id TEXT, kind TEXT, prompt TEXT,
+                                  state TEXT NOT NULL, response TEXT);
+        ''')
+        db.execute('INSERT INTO settings VALUES (?)', (json.dumps(dict(
+            run_id=rid, model=args.model, max_parallel=min(args.max_parallel, MAX_PARALLEL),
+            timeout=args.timeout, created_at=time.time())),))
+        for i, t in enumerate(tasks, 1):
+            t.update(task_id='task_' + rid[4:] + '_' + str(i), status='queued',
+                     actions={}, total_actions=0, tokens=0, final_result='', error=None,
+                     round=0, history=[], pending=[t['prompt']], updated_at=time.time())
+            db.execute('INSERT INTO tasks VALUES (?, ?, ?)',
+                       (t['task_id'], i, json.dumps(t, ensure_ascii=False)))
+    spawn_worker(p)
+    return snapshot(rid)
+
+
+def snapshot(value):
+    p = run_path(value)
+    with connect(p) as db:
+        opts, tasks = settings(db), task_rows(db)
+        commands = [dict(r) for r in db.execute(
+            "SELECT id, task_id, kind, state, response FROM commands WHERE state='pending'")]
+    alive = worker_alive(p)
+    # A missing worker is not equivalent to a completed task. Allow a short boot window.
+    if not alive and time.time() - opts['created_at'] > 5:
+        for t in tasks:
+            if t['status'] not in TERMINAL:
+                t['status'] = 'orphaned'
+                t['error'] = '后台 worker 已退出；执行是否停止未经确认，日志: ' + str(p / 'worker.log')
+    if value.startswith('task_'):
+        tasks = [t for t in tasks if t['task_id'] == value]
+        if not tasks:
+            raise ValueError('找不到 task: ' + value)
+        commands = [c for c in commands if c['task_id'] == value]
+    return dict(run_id=p.name, worker_alive=alive, log=str(p / 'worker.log'),
+                summary=dict(total=len(tasks), ok=sum(t['status'] == 'ok' for t in tasks),
+                             done=sum(t['status'] in TERMINAL for t in tasks),
+                             parallel=min(opts['max_parallel'], len(tasks))),
+                pending_commands=commands, tasks=tasks)
+
+
+def finished(result):
+    terminal = all(t['status'] in TERMINAL for t in result['tasks'])
+    lost_worker = (not result['worker_alive'] and
+                   any(t['status'] == 'orphaned' for t in result['tasks']))
+    return terminal and (not result['pending_commands'] or lost_worker)
+
+
+def list_tasks(active_only=False, recent=10, run_id=None):
+    if recent < 0:
+        raise ValueError('--recent 不可为负数')
+    if run_id:
+        if not re.fullmatch(r'run_[a-f0-9]{12}', run_id):
+            raise ValueError('--run 需要 run_id')
+        paths = [run_path(run_id)]
+    else:
+        paths = sorted(p for p in state_home().glob('run_*')
+                       if re.fullmatch(r'run_[a-f0-9]{12}', p.name) and (p / 'state.db').is_file())
+    groups = dict(active=[], attention=[], recent=[])
+    errors = []
+    for p in paths:
+        try:
+            result = snapshot(p.name)
+            for task in result['tasks']:
+                row = dict(task, run_id=p.name, worker_alive=result['worker_alive'])
+                group = ('attention' if task['status'] == 'orphaned' else
+                         'recent' if task['status'] in TERMINAL else 'active')
+                groups[group].append(row)
+        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as e:
+            errors.append(dict(run_id=p.name, error=str(e)))
+    groups['active'].sort(key=lambda t: (t['status'] == 'queued', -t['updated_at'], t['task_id']))
+    for group in ('attention', 'recent'):
+        groups[group].sort(key=lambda t: (-t['updated_at'], t['task_id']))
+    total_recent = len(groups['recent'])
+    groups['recent'] = groups['recent'][:recent] if not active_only else []
+    if active_only:
+        groups['attention'] = []
+    return dict(listing=True, **groups, errors=errors,
+                summary=dict(active=len(groups['active']), attention=len(groups['attention']),
+                             recent=len(groups['recent']), total_recent=total_recent))
+
+
+def relative_time(timestamp):
+    seconds = max(0, int(time.time() - timestamp))
+    if seconds < 60:
+        return '%s秒前' % seconds
+    if seconds < 3600:
+        return '%s分钟前' % (seconds // 60)
+    if seconds < 86400:
+        return '%s小时前' % (seconds // 3600)
+    return '%s天前' % (seconds // 86400)
+
+
+def wait(value, timeout=None):
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while True:
+        result = snapshot(value)
+        if finished(result):
+            return result, 0 if all(t['status'] == 'ok' for t in result['tasks']) else 1
+        if deadline is not None and time.monotonic() >= deadline:
+            return result, 124
+        time.sleep(.2)
+
+
+def control(value, kind, prompt=''):
+    if not value.startswith('task_'):
+        raise ValueError('send/cancel 需要 task_id；整批 run 请逐任务操作')
+    p = run_path(value)
+    current = snapshot(value)['tasks'][0]
+    if current['status'] == 'orphaned':
+        raise ValueError(current['error'] + '；请先检查遗留进程，再用 --session 显式续跑')
+    cid = identifier('cmd_')
+    with connect(p) as db:
+        db.execute('INSERT INTO commands VALUES (?, ?, ?, ?, ?, NULL)',
+                   (cid, value, kind, prompt, 'pending'))
+    deadline = time.monotonic() + 35
+    while True:
+        spawn_worker(p)
+        with connect(p) as db:
+            row = db.execute('SELECT state, response FROM commands WHERE id=?', (cid,)).fetchone()
+        if row['state'] != 'pending':
+            result = json.loads(row['response'])
+            result['command_id'] = cid
+            return result, 0 if row['state'] == 'done' else 1
+        if time.monotonic() >= deadline:
+            return dict(command_id=cid, task_id=value, status='pending',
+                        error='控制指令尚未确认；用 status 检查 pending_commands，请勿重复发送'), 2
+        time.sleep(.2)
+
+
+def request_json(base, method, route, directory=None, body=None, timeout=5):
+    if directory:
+        route += ('&' if '?' in route else '?') + urllib.parse.urlencode({'directory': directory})
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {'Content-Type': 'application/json'}
+    if isinstance(base, tuple):
+        base, password = base
+        headers['Authorization'] = 'Basic ' + base64.b64encode(
+            ('deveco:' + password).encode()).decode()
+    req = urllib.request.Request(base + route, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        raise RuntimeError('DevEco HTTP %s: %s' % (e.code, e.read().decode(errors='replace')[-1000:])) from e
+
+
+def terminate(proc):
+    if proc is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+
+
+def launch_server(log):
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+    password = uuid.uuid4().hex + uuid.uuid4().hex
+    env = dict(os.environ, DEVECO_SERVER_PASSWORD=password, DEVECO_SERVER_USERNAME='deveco')
+    proc = subprocess.Popen([ensure_deveco(), 'serve', '--hostname', '127.0.0.1', '--port', str(port)],
+                            env=env,
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                            start_new_session=True)
+    base = ('http://127.0.0.1:' + str(port), password)
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError('deveco serve 提前退出: ' + str(proc.returncode))
+            try:
+                doc = request_json(base, 'GET', '/doc', timeout=1)
+                paths = doc.get('paths', {})
+                needed = ['/session', '/session/status', '/session/{sessionID}/prompt_async',
+                          '/session/{sessionID}/abort', '/session/{sessionID}/message']
+                if not all(k in paths for k in needed):
+                    raise ValueError('DevEco 缺少异步调度 API；请升级 CLI')
+                return proc, base
+            except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError):
+                time.sleep(.2)
+        raise RuntimeError('deveco serve 30 秒内未就绪')
+    except BaseException:
+        terminate(proc)
+        raise
+
+
+def round_result(messages, message_id):
+    """Only count assistant messages belonging to this particular user turn."""
+    replies = [m for m in messages if m.get('info', {}).get('role') == 'assistant'
+               and m['info'].get('parentID') == message_id]
+    actions, texts, tokens, error = Counter(), [], 0, None
+    for m in replies:
+        info = m['info']
+        tk = info.get('tokens') or {}
+        total = tk.get('total')
+        if total is None:
+            total = sum(tk.get(k, 0) or 0 for k in ('input', 'output', 'reasoning'))
+            total += sum((tk.get('cache') or {}).values())
+        tokens += total
+        error = info.get('error') or error
+        for part in m.get('parts', []):
+            if part.get('type') == 'tool':
+                actions[part.get('tool') or '?'] += 1
+            elif part.get('type') == 'text' and part.get('text'):
+                texts.append(part['text'])
+    last = replies[-1]['info'] if replies else {}
+    return dict(actions=dict(actions), total_actions=sum(actions.values()), tokens=tokens,
+                final_result='\n\n'.join(texts).strip(), error=error,
+                finish=last.get('finish'), completed=bool((last.get('time') or {}).get('completed')))
+
+
+class Runner:
+    def __init__(self, p, db, base, opts):
+        self.p, self.db, self.base, self.opts = p, db, base, opts
+        self.locks = {}
+        self.stopping = False
+
+    def api(self, t, method, route, body=None, timeout=5):
+        return request_json(self.base, method, route, t['dir'], body, timeout)
+
+    def acquire_session(self, t):
+        if t['task_id'] in self.locks:
+            return
+        directory = state_home() / 'sessions'
+        directory.mkdir(exist_ok=True, mode=0o700)
+        key = hashlib.sha256(t['session_id'].encode()).hexdigest()
+        f = open(directory / (key + '.lock'), 'a')
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            f.close()
+            raise RuntimeError('该 session 正被其他 de-run 任务使用')
+        self.locks[t['task_id']] = f
+
+    def release_session(self, t):
+        f = self.locks.pop(t['task_id'], None)
+        if f:
+            f.close()
+
+    def persist(self, t):
+        save_task(self.db, t)
+
+    def record_round(self, t, status):
+        if t.get('message_id'):
+            t['history'].append({k: t.get(k) for k in (
+                'round', 'message_id', 'prompt', 'actions', 'total_actions', 'tokens',
+                'final_result', 'error', 'finish', 'started_at')})
+            t['history'][-1].update(status=status, ended_at=time.time())
+            t['message_id'] = None
+
+    def refresh(self, t):
+        messages = self.api(t, 'GET', '/session/' + t['session_id'] + '/message')
+        t.update(round_result(messages, t['message_id']))
+
+    def abort(self, t):
+        """Do not send the replacement until DevEco acknowledges abort and becomes idle."""
+        if not t.get('session_id'):
+            return
+        t['status'] = 'interrupting'
+        self.persist(t)
+        answer = self.api(t, 'POST', '/session/' + t['session_id'] + '/abort', {})
+        if answer is not True:
+            raise RuntimeError('DevEco 未确认 abort；没有发送新指令')
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            statuses = self.api(t, 'GET', '/session/status', timeout=2)
+            if statuses.get(t['session_id'], {}).get('type', 'idle') == 'idle':
+                if t.get('message_id'):
+                    self.refresh(t)
+                return
+            time.sleep(.1)
+        raise RuntimeError('abort 后 session 仍未空闲；没有发送新指令')
+
+    def prepare(self, t):
+        if not t.get('session_id'):
+            session = self.api(t, 'POST', '/session', {
+                'title': t['title'],
+                'permission': [{'permission': '*', 'pattern': '*', 'action': 'allow'}]})
+            t['session_id'] = session['id']
+            self.persist(t)
+        self.acquire_session(t)
+        session = self.api(t, 'GET', '/session/' + t['session_id'])
+        if Path(session['directory']).resolve() != Path(t['dir']).resolve():
+            raise RuntimeError('--dir 与 session 原属目录不一致: ' + session['directory'])
+        statuses = self.api(t, 'GET', '/session/status')
+        if statuses.get(t['session_id'], {}).get('type', 'idle') != 'idle':
+            raise RuntimeError('session 已在 DevEco 中运行，拒绝覆盖外部任务')
+
+    def dispatch(self, t):
+        self.prepare(t)
+        t['prompt'] = t['pending'].pop(0)
+        t.update(status='running', round=t['round'] + 1,
+                 message_id=message_identifier(), started_at=time.time(),
+                 actions={}, total_actions=0, tokens=0, final_result='', error=None,
+                 finish=None, completed=False)
+        self.persist(t)  # Persist identity before the HTTP side effect.
+        body = dict(messageID=t['message_id'], parts=[{'type': 'text', 'text': t['prompt']}])
+        model = self.opts.get('model')
+        if model:
+            provider, name = model.split('/', 1)
+            body['model'] = dict(providerID=provider, modelID=name)
+        self.api(t, 'POST', '/session/' + t['session_id'] + '/prompt_async', body)
+
+    def poll(self, t):
+        statuses = self.api(t, 'GET', '/session/status')
+        state = statuses.get(t['session_id'], {}).get('type', 'idle')
+        # Read messages after observing idle, so a stale tool step cannot hide the final reply.
+        self.refresh(t)
+        t['upstream_status'] = state
+        if time.time() - t['started_at'] >= self.opts['timeout']:
+            self.abort(t)
+            t.update(status='timeout', error='超过每轮执行时限，已确认中止')
+        elif state == 'idle' and (t['completed'] or t['error']):
+            if t['error']:
+                t['status'] = 'failed'
+            elif t['finish'] == 'stop' and t['final_result']:
+                t['status'] = 'ok'
+            else:
+                t.update(status='incomplete', error='执行结束但没有完整最终报告 (finish=%s)' % t['finish'])
+        if t['status'] in TERMINAL:
+            self.record_round(t, t['status'])
+            if t['pending'] and t['status'] == 'ok':
+                t['status'] = 'queued'
+            self.release_session(t)
+        self.persist(t)
+
+    def commands(self):
+        rows = self.db.execute("SELECT * FROM commands WHERE state='pending' ORDER BY rowid").fetchall()
+        for c in rows:
+            t = json.loads(self.db.execute('SELECT data FROM tasks WHERE id=?', (c['task_id'],)).fetchone()[0])
+            try:
+                was_running = t['status'] == 'running'
+                if t['status'] in ('orphaned', 'interrupting'):
+                    raise RuntimeError('执行状态不确定，拒绝继续；请检查 worker.log')
+                if c['kind'] == 'queue':
+                    t['pending'].append(c['prompt'])
+                    if t['status'] in TERMINAL:
+                        t['status'] = 'queued'
+                else:
+                    if t['status'] == 'running':
+                        self.abort(t)
+                        self.record_round(t, 'interrupted' if c['kind'] == 'send' else 'cancelled')
+                    t['pending'] = [c['prompt']] if c['kind'] == 'send' else []
+                    t['status'] = 'queued' if c['kind'] == 'send' else 'cancelled'
+                    t['error'] = None
+                    self.release_session(t)
+                self.persist(t)
+                response = dict(task_id=t['task_id'], session_id=t['session_id'],
+                                status=t['status'], interrupted=c['kind'] == 'send' and was_running,
+                                queued=len(t['pending']))
+                outcome = 'done'
+            except Exception as e:
+                # Never pretend interruption succeeded. Keep uncertainty visible.
+                if t['status'] == 'interrupting':
+                    t.update(status='orphaned', error=str(e))
+                    self.persist(t)
+                response, outcome = dict(task_id=t['task_id'], status=t['status'], error=str(e)), 'failed'
+            with self.db:
+                self.db.execute('UPDATE commands SET state=?, response=? WHERE id=?',
+                                (outcome, json.dumps(response, ensure_ascii=False), c['id']))
+
+    def loop(self, proc):
+        while not self.stopping:
+            if proc.poll() is not None:
+                raise RuntimeError('deveco serve 意外退出: ' + str(proc.returncode))
+            self.commands()
+            tasks = task_rows(self.db)
+            for t in tasks:
+                if t['status'] == 'running':
+                    try:
+                        self.poll(t)
+                    except Exception as e:
+                        # Communication failures can leave remote work active; stop before reporting failure.
+                        try:
+                            self.abort(t)
+                            t.update(status='failed', error=str(e))
+                            self.record_round(t, 'failed')
+                        except Exception as abort_error:
+                            t.update(status='orphaned', error='%s; 中止未确认: %s' % (e, abort_error))
+                        if t['status'] != 'orphaned':
+                            self.release_session(t)
+                        self.persist(t)
+            tasks = task_rows(self.db)
+            slots = self.opts['max_parallel'] - sum(t['status'] in ('running', 'interrupting') for t in tasks)
+            for t in tasks:
+                if self.stopping:
+                    break
+                if slots > 0 and t['status'] == 'queued' and t['pending']:
+                    try:
+                        self.dispatch(t)
+                        slots -= 1
+                    except Exception as e:
+                        if t['status'] == 'running':
+                            try:
+                                self.abort(t)
+                            except Exception as abort_error:
+                                t.update(status='orphaned', error='%s; 中止未确认: %s' % (e, abort_error))
+                        if t['status'] != 'orphaned':
+                            t.update(status='failed', error=str(e))
+                        if t['status'] != 'orphaned':
+                            self.release_session(t)
+                        self.persist(t)
+            tasks = task_rows(self.db)
+            pending = self.db.execute("SELECT count(*) FROM commands WHERE state='pending'").fetchone()[0]
+            if all(t['status'] in TERMINAL for t in tasks) and not pending:
+                return
+            time.sleep(.2)
+
+
+def worker(rid):
+    p = run_path(rid)
+    with open(p / 'worker.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        db, proc, runner = connect(p), None, None
+        try:
+            opts = settings(db)
+            opts['worker_pid'] = os.getpid()
+            with db:
+                db.execute('UPDATE settings SET data=?', (json.dumps(opts),))
+            # Restarting a worker must never replay an uncertain previous HTTP submission.
+            for t in task_rows(db):
+                if t['status'] in ('running', 'interrupting'):
+                    t.update(status='orphaned', error='上次 worker 异常退出；请检查遗留执行后显式续跑')
+                    save_task(db, t)
+            with open(p / 'serve.log', 'ab', buffering=0) as log:
+                proc, base = launch_server(log)
+                runner = Runner(p, db, base, settings(db))
+                def stop(signum, frame):
+                    runner.stopping = True
+                signal.signal(signal.SIGTERM, stop)
+                signal.signal(signal.SIGINT, stop)
+                runner.loop(proc)
+        except Exception as e:
+            print('worker error:', repr(e), flush=True)
+            traceback.print_exc()
+            for t in task_rows(db):
+                if t['status'] not in TERMINAL:
+                    t.update(status='orphaned' if t['status'] in ('running', 'interrupting') else 'failed', error=str(e))
+                    save_task(db, t)
+            with db:
+                db.execute("UPDATE commands SET state='failed', response=? WHERE state='pending'",
+                           (json.dumps(dict(error=str(e))),))
+        finally:
+            if runner:
+                for t in task_rows(db):
+                    if t['status'] in ('running', 'interrupting', 'orphaned') and t['task_id'] in runner.locks:
+                        try:
+                            runner.abort(t)
+                            t.update(status='cancelled', error='worker 停止，已确认中止')
+                        except Exception as e:
+                            t.update(status='orphaned', error='worker 停止，中止未确认: ' + str(e))
+                        runner.persist(t)
+            terminate(proc)
+            if runner:
+                for t in task_rows(db):
+                    runner.release_session(t)
+            db.close()
     return 0
 
 
-if __name__ == "__main__":
+def list_sessions(n):
+    executable = ensure_deveco()
+    path = Path('~/.local/share/deveco/deveco.db').expanduser()
+    try:
+        result = subprocess.run([executable, 'db', 'path'], capture_output=True, text=True, timeout=30)
+        candidate = Path(result.stdout.strip())
+        if result.returncode == 0 and candidate.is_file():
+            path = candidate
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not path.is_file():
+        raise ValueError('找不到 DevEco 数据库: ' + str(path))
+    with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
+        rows = db.execute('SELECT id,title,directory,time_updated,model FROM session '
+                          'WHERE time_archived IS NULL ORDER BY time_updated DESC LIMIT ?',
+                          (max(0, min(n, 10000)),)).fetchall()
+    return [dict(session_id=r[0], title=r[1], dir=r[2], updated_at=r[3], model=r[4]) for r in rows]
+
+
+def emit(value, as_json=False, truncate=None, verbose=False):
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+        return
+    if isinstance(value, list):
+        for row in value:
+            print(json.dumps(row, ensure_ascii=False))
+    elif value.get('listing'):
+        count = sum(len(value[k]) for k in ('active', 'attention', 'recent'))
+        if not count:
+            print('没有符合条件的 de-run 任务')
+        for key, title in (('active', '活跃任务'), ('attention', '待处理异常'), ('recent', '最近结束')):
+            if not value[key]:
+                continue
+            print('%s（%s）' % (title, len(value[key])))
+            print('  task_id                 状态          标题  最近更新  run_id')
+            for t in value[key]:
+                title = ' '.join(t['title'].split())
+                if len(title) > 40:
+                    title = title[:39] + '…'
+                print('  %s  %-12s  %s  %s  %s' % (
+                    t['task_id'], t['status'], title, relative_time(t['updated_at']), t['run_id']))
+                if verbose:
+                    print('    session=%s  dir=%s' % (t.get('session_id') or '-', t['dir']))
+        for error in value['errors']:
+            print('警告: 无法读取 %s: %s' % (error['run_id'], error['error']), file=sys.stderr)
+    elif 'tasks' in value:
+        print('%s · 完成 %s/%s · 成功 %s' % (value['run_id'], value['summary']['done'],
+                                          value['summary']['total'], value['summary']['ok']))
+        for t in value['tasks']:
+            print('  %s  %s  %s' % (t['task_id'], t['status'], t['title']))
+            if verbose:
+                print('    session=%s' % (t['session_id'] or '-'))
+            text = t.get('error') or t.get('final_result')
+            if text:
+                text = str(text)
+                print('    ' + (text[:truncate] + '…' if truncate and len(text) > truncate else text))
+        if value.get('pending_commands'):
+            print('  尚有 %s 条控制指令等待确认' % len(value['pending_commands']))
+    else:
+        display = value if verbose else {k: v for k, v in value.items() if k != 'session_id'}
+        print(json.dumps(display, ensure_ascii=False))
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == '_worker':
+        return worker(argv[1])
+    if not argv or argv in (['--help'], ['-h']):
+        print(HELP)
+        return 0
+    command = argv.pop(0) if argv[0] in ('start', 'run', 'list', 'status', 'wait', 'send', 'cancel', 'result') else 'start'
+    parser = argparse.ArgumentParser(prog='de-run ' + command, description=HELP,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--truncate', type=int)
+    parser.add_argument('--verbose', action='store_true', help='显示底层 session ID 等详细信息')
+    if command == 'start' or command == 'run':
+        parser.add_argument('--dir', action='append', default=[])
+        parser.add_argument('--prompt', action='append', default=[])
+        parser.add_argument('--session', action='append', default=[])
+        parser.add_argument('--sessions', nargs='?', const=15, type=int)
+        parser.add_argument('--tasks')
+        parser.add_argument('--model')
+        parser.add_argument('--max-parallel', type=int, default=6)
+        parser.add_argument('--timeout', type=int, default=900)
+        parser.add_argument('--wait', action='store_true')
+    elif command == 'list':
+        parser.add_argument('--active', action='store_true')
+        parser.add_argument('--recent', type=int, default=10)
+        parser.add_argument('--run')
+    else:
+        parser.add_argument('id')
+        if command == 'send':
+            parser.add_argument('text', nargs='?')
+            parser.add_argument('--prompt')
+            parser.add_argument('--queue', action='store_true')
+        if command == 'wait':
+            parser.add_argument('--timeout', type=float)
+    args = parser.parse_args(argv)
+    try:
+        code = 0
+        if command in ('start', 'run'):
+            if args.sessions is not None:
+                result = list_sessions(args.sessions)
+            else:
+                result = start(args)
+                if args.wait:
+                    print('已启动 ' + result['run_id'], file=sys.stderr)
+                    result, code = wait(result['run_id'])
+        elif command == 'list':
+            result = list_tasks(args.active, args.recent, args.run)
+            code = 1 if result['errors'] else 0
+        elif command in ('status', 'result'):
+            result = snapshot(args.id)
+            if command == 'result':
+                code = (0 if all(t['status'] == 'ok' for t in result['tasks']) else 1) if finished(result) else 2
+        elif command == 'wait':
+            if args.timeout is not None and args.timeout < 0:
+                raise ValueError('等待超时不可为负数')
+            result, code = wait(args.id, args.timeout)
+        else:
+            text = (args.text or args.prompt) if command == 'send' else ''
+            if command == 'send' and (not text or not text.strip()):
+                raise ValueError('send 需要非空指令文本')
+            result, code = control(args.id, 'queue' if command == 'send' and args.queue else command, text)
+        emit(result, args.json, args.truncate, args.verbose)
+        return code
+    except (ValueError, OSError, sqlite3.Error, RuntimeError) as e:
+        if args.json:
+            emit(dict(error=str(e)), True)
+        else:
+            print('错误: ' + str(e), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print('停止等待；后台任务继续运行。使用 cancel TASK_ID 停止任务。', file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
     sys.exit(main())
