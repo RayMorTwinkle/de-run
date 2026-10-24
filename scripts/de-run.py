@@ -16,6 +16,8 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -24,6 +26,7 @@ import urllib.request
 import uuid
 
 MAX_PARALLEL = 6
+IDLE_GRACE = 30  # prompt_async may return before startup marks the session busy.
 TERMINAL = {'ok', 'failed', 'incomplete', 'cancelled', 'timeout', 'orphaned'}
 HELP = '''de-run — 异步 DevEco 子 Agent 调度（需要提供 /doc API 的 DevEco）
 
@@ -45,11 +48,13 @@ HELP = '''de-run — 异步 DevEco 子 Agent 调度（需要提供 /doc API 的 
       获取报告、错误和各轮历史；任务未结束时退出码为 2。
   de-run --sessions [N] [--json]
       只读列出 DevEco 的历史 session。
+  de-run models [--dir PATH] [--json]
+      查询当前目录已连接 provider 的模型；不提交模型任务。
 
 启动选项：
   --tasks FILE          JSON 数组或 {"tasks": [...]}，每项 dir/prompt/title/session
   --session SES_ID      续跑已有 session；工作目录必须与 session 一致
-  --model PROVIDER/MODEL
+  --model PROVIDER/MODEL 显式选择模型；省略时自动选择并提交可用模型
   --max-parallel N      默认 6，上限 6（每一批次）
   --timeout SEC         每轮执行上限，默认 900 秒；超时主动 abort
   --wait                启动后阻塞，便于迁移原先的调用方式
@@ -205,6 +210,7 @@ def start(args):
         for i, t in enumerate(tasks, 1):
             t.update(task_id='task_' + rid[4:] + '_' + str(i), status='queued',
                      actions={}, total_actions=0, tokens=0, final_result='', error=None,
+                     model=args.model, model_source='explicit' if args.model else None,
                      round=0, history=[], pending=[t['prompt']], updated_at=time.time())
             db.execute('INSERT INTO tasks VALUES (?, ?, ?)',
                        (t['task_id'], i, json.dumps(t, ensure_ascii=False)))
@@ -326,7 +332,7 @@ def control(value, kind, prompt=''):
         time.sleep(.2)
 
 
-def request_json(base, method, route, directory=None, body=None, timeout=5):
+def http_request(base, method, route, directory=None, body=None):
     if directory:
         route += ('&' if '?' in route else '?') + urllib.parse.urlencode({'directory': directory})
     data = json.dumps(body).encode() if body is not None else None
@@ -335,7 +341,11 @@ def request_json(base, method, route, directory=None, body=None, timeout=5):
         base, password = base
         headers['Authorization'] = 'Basic ' + base64.b64encode(
             ('deveco:' + password).encode()).decode()
-    req = urllib.request.Request(base + route, data=data, method=method, headers=headers)
+    return urllib.request.Request(base + route, data=data, method=method, headers=headers)
+
+
+def request_json(base, method, route, directory=None, body=None, timeout=5):
+    req = http_request(base, method, route, directory, body)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -379,7 +389,7 @@ def launch_server(log):
                 doc = request_json(base, 'GET', '/doc', timeout=1)
                 paths = doc.get('paths', {})
                 needed = ['/session', '/session/status', '/session/{sessionID}/prompt_async',
-                          '/session/{sessionID}/abort', '/session/{sessionID}/message']
+                          '/session/{sessionID}/abort', '/session/{sessionID}/message', '/event']
                 if not all(k in paths for k in needed):
                     raise ValueError('DevEco 缺少异步调度 API；请升级 CLI')
                 return proc, base
@@ -389,6 +399,78 @@ def launch_server(log):
     except BaseException:
         terminate(proc)
         raise
+
+
+class SessionEvents:
+    """Subscribe before submission: early prompt failures have no message to poll.
+
+    Each turn has its own subscription so late abort errors from a previous turn
+    cannot contaminate its replacement. Only the reader owns the HTTP response;
+    close asks it to exit on the next event/heartbeat (or its 30-second timeout).
+    """
+    def __init__(self, base, directory, session_id):
+        self.ready, self.stopping = threading.Event(), threading.Event()
+        self.lock = threading.Lock()
+        self.connected, self.error, self.failure = False, None, None
+        self.thread = threading.Thread(target=self.listen, args=(base, directory, session_id), daemon=True)
+        self.thread.start()
+        self.ready.wait(5)
+        if not self.connected:
+            self.close()
+            raise RuntimeError('DevEco 事件流未就绪: ' + (self.failure or '5 秒内未收到 server.connected'))
+
+    def listen(self, base, directory, session_id):
+        try:
+            req = http_request(base, 'GET', '/event', directory)
+            req.add_header('Accept', 'text/event-stream')
+            with urllib.request.urlopen(req, timeout=30) as stream:
+                data = []
+                size = 0
+                while not self.stopping.is_set():
+                    line = stream.readline(1024 * 1024)
+                    if not line:
+                        raise RuntimeError('连接已断开')
+                    size += len(line)
+                    if size > 1024 * 1024:
+                        raise RuntimeError('事件超过 1 MiB')
+                    line = line.rstrip(b'\r\n')
+                    if line.startswith(b'data:'):
+                        data.append(line[5:].lstrip(b' '))
+                    elif not line:
+                        if data:
+                            event = json.loads(b'\n'.join(data))
+                            with self.lock:
+                                if event.get('type') == 'server.connected':
+                                    self.connected = True
+                                    self.ready.set()
+                                props = event.get('properties') or {}
+                                if event.get('type') == 'session.error' and props.get('sessionID') == session_id:
+                                    self.error = props.get('error') or {'name': 'UnknownError'}
+                        data, size = [], 0
+        except Exception as e:
+            with self.lock:
+                self.failure = str(e)
+        finally:
+            self.ready.set()
+
+    def get_error(self):
+        with self.lock:
+            if self.error:
+                return self.error
+            if self.failure:
+                raise RuntimeError('DevEco 事件流失效，无法可靠接收执行错误: ' + self.failure)
+        return None
+
+    def close(self):
+        self.stopping.set()
+
+
+def model_error_hint(error):
+    if error and any(name in str(error) for name in (
+            'ProviderNoProvidersError', 'ProviderModelNotFoundError', 'ProviderNotFoundError', 'ModelNotFoundError')):
+        return ('使用 de-run models --dir <任务目录> 查询已连接模型，再以 --model provider/model 显式启动；'
+                '也可检查 DevEco 的默认模型和登录配置。')
+    return None
 
 
 def round_result(messages, message_id):
@@ -420,6 +502,8 @@ class Runner:
     def __init__(self, p, db, base, opts):
         self.p, self.db, self.base, self.opts = p, db, base, opts
         self.locks = {}
+        self.events = {}
+        self.catalogs = {}
         self.stopping = False
 
     def api(self, t, method, route, body=None, timeout=5):
@@ -440,18 +524,23 @@ class Runner:
         self.locks[t['task_id']] = f
 
     def release_session(self, t):
+        events = self.events.pop(t['task_id'], None)
+        if events:
+            events.close()
         f = self.locks.pop(t['task_id'], None)
         if f:
             f.close()
 
     def persist(self, t):
+        t['error_hint'] = model_error_hint(t.get('error'))
         save_task(self.db, t)
 
     def record_round(self, t, status):
+        t['error_hint'] = model_error_hint(t.get('error'))
         if t.get('message_id'):
             t['history'].append({k: t.get(k) for k in (
                 'round', 'message_id', 'prompt', 'actions', 'total_actions', 'tokens',
-                'final_result', 'error', 'finish', 'started_at')})
+                'final_result', 'error', 'error_hint', 'model', 'model_source', 'finish', 'started_at')})
             t['history'][-1].update(status=status, ended_at=time.time())
             t['message_id'] = None
 
@@ -492,20 +581,39 @@ class Runner:
         statuses = self.api(t, 'GET', '/session/status')
         if statuses.get(t['session_id'], {}).get('type', 'idle') != 'idle':
             raise RuntimeError('session 已在 DevEco 中运行，拒绝覆盖外部任务')
+        return session
+
+    def resolve_model(self, t, session):
+        if self.opts.get('model'):
+            return self.opts['model'], 'explicit'
+        if t['dir'] not in self.catalogs:
+            self.catalogs[t['dir']] = model_catalog(self.base, t['dir'])
+        models, config, agents = self.catalogs[t['dir']]
+        available = {row['model'] for row in models}
+        previous = next((candidate for candidate in (t.get('model'), session.get('model'))
+                         if model_name(candidate) in available), None)
+        if not previous:
+            messages = self.api(t, 'GET', '/session/' + t['session_id'] + '/message')
+            for message in reversed(messages):
+                info = message.get('info') or {}
+                previous = info.get('model') if info.get('role') == 'user' else info
+                if model_name(previous) in available:
+                    break
+        return choose_model(models, config, agents, previous)
 
     def dispatch(self, t):
-        self.prepare(t)
+        session = self.prepare(t)
+        model, source = self.resolve_model(t, session)
+        self.events[t['task_id']] = SessionEvents(self.base, t['dir'], t['session_id'])
         t['prompt'] = t['pending'].pop(0)
         t.update(status='running', round=t['round'] + 1,
                  message_id=message_identifier(), started_at=time.time(),
                  actions={}, total_actions=0, tokens=0, final_result='', error=None,
-                 finish=None, completed=False)
+                 finish=None, completed=False, idle_since=None, model=model, model_source=source)
         self.persist(t)  # Persist identity before the HTTP side effect.
         body = dict(messageID=t['message_id'], parts=[{'type': 'text', 'text': t['prompt']}])
-        model = self.opts.get('model')
-        if model:
-            provider, name = model.split('/', 1)
-            body['model'] = dict(providerID=provider, modelID=name)
+        provider, name = model.split('/', 1)
+        body['model'] = dict(providerID=provider, modelID=name)
         self.api(t, 'POST', '/session/' + t['session_id'] + '/prompt_async', body)
 
     def poll(self, t):
@@ -513,17 +621,30 @@ class Runner:
         state = statuses.get(t['session_id'], {}).get('type', 'idle')
         # Read messages after observing idle, so a stale tool step cannot hide the final reply.
         self.refresh(t)
+        if not t['error']:
+            t['error'] = self.events[t['task_id']].get_error()
         t['upstream_status'] = state
-        if time.time() - t['started_at'] >= self.opts['timeout']:
+        if t['error']:
+            error = t['error']
+            if state != 'idle':
+                self.abort(t)
+            t.update(status='failed', error=error)
+        elif time.time() - t['started_at'] >= self.opts['timeout']:
             self.abort(t)
             t.update(status='timeout', error='超过每轮执行时限，已确认中止')
-        elif state == 'idle' and (t['completed'] or t['error']):
-            if t['error']:
-                t['status'] = 'failed'
-            elif t['finish'] == 'stop' and t['final_result']:
+        elif state == 'idle' and t['completed']:
+            if t['finish'] == 'stop' and t['final_result']:
                 t['status'] = 'ok'
             else:
                 t.update(status='incomplete', error='执行结束但没有完整最终报告 (finish=%s)' % t['finish'])
+        elif state == 'idle':
+            t['idle_since'] = t.get('idle_since') or time.time()
+            if time.time() - t['idle_since'] >= IDLE_GRACE:
+                self.abort(t)
+                t.update(status='incomplete', error='DevEco 持续空闲 %s 秒但没有完整回复，已确认中止；'
+                         '请检查默认模型配置或 DevEco 日志' % IDLE_GRACE)
+        else:
+            t['idle_since'] = None
         if t['status'] in TERMINAL:
             self.record_round(t, t['status'])
             if t['pending'] and t['status'] == 'ok':
@@ -668,6 +789,61 @@ def worker(rid):
     return 0
 
 
+def model_name(value):
+    if isinstance(value, dict):
+        provider, name = value.get('providerID'), value.get('modelID') or value.get('id')
+        return provider + '/' + name if provider and name else None
+    return value if isinstance(value, str) and '/' in value else None
+
+
+def model_catalog(base, directory):
+    # Project/plugin initialization can exceed the normal five-second poll limit.
+    def read(route):
+        try:
+            return request_json(base, 'GET', route, directory, timeout=30)
+        except (TimeoutError, socket.timeout) as e:
+            raise RuntimeError('DevEco 模型配置查询超时（30 秒）: ' + route) from e
+    catalog = read('/provider')
+    connected = set(catalog['connected'])
+    models = [dict(model=p['id'] + '/' + mid, name=info.get('name') or mid,
+                   provider_default=catalog.get('default', {}).get(p['id']) == mid)
+              for p in catalog['all'] if p['id'] in connected
+              for mid, info in p.get('models', {}).items()]
+    return (sorted(models, key=lambda x: x['model']),
+            read('/config'), read('/agent'))
+
+
+def choose_model(models, config, agents, previous=None):
+    """Use only connected catalog entries; explicit CLI overrides bypass this policy."""
+    available = {row['model'] for row in models}
+    if not available:
+        raise RuntimeError('没有已连接的可用模型；请运行 deveco auth login 并检查 provider 配置')
+    agent = next((a for a in agents if a['name'] == config.get('default_agent', 'build')), {})
+    for candidate, source in ((previous, 'session'), (agent.get('model'), 'agent'),
+                              (config.get('model'), 'config')):
+        name = model_name(candidate)
+        if name in available:
+            return name, source
+    defaults = [row['model'] for row in models if row['provider_default']]
+    if defaults:
+        return min(defaults, key=lambda name: (not name.startswith('deveco/'), name)), 'provider_default'
+    return min(available, key=lambda name: (not name.startswith('deveco/'), name)), 'first_available'
+
+
+def list_models(directory):
+    directory = Path(directory).expanduser().resolve()
+    if not directory.is_dir():
+        raise ValueError('工作目录不存在: ' + str(directory))
+    with tempfile.TemporaryFile() as log:
+        proc, base = launch_server(log)
+        try:
+            models, config, agents = model_catalog(base, str(directory))
+            model, source = choose_model(models, config, agents) if models else (None, None)
+            return dict(dir=str(directory), models=models, default_model=model, default_source=source)
+        finally:
+            terminate(proc)
+
+
 def list_sessions(n):
     executable = ensure_deveco()
     path = Path('~/.local/share/deveco/deveco.db').expanduser()
@@ -694,6 +870,12 @@ def emit(value, as_json=False, truncate=None, verbose=False):
     if isinstance(value, list):
         for row in value:
             print(json.dumps(row, ensure_ascii=False))
+    elif 'models' in value:
+        print('现有模型列表（%s）' % value['dir'])
+        if not value['models']:
+            print('  没有可用模型；请检查 deveco auth login 和 provider 配置')
+        for row in sorted(value['models'], key=lambda x: (x['model'] != value['default_model'], x['model'])):
+            print('  %s%s' % (row['model'], '（默认）' if row['model'] == value['default_model'] else ''))
     elif value.get('listing'):
         count = sum(len(value[k]) for k in ('active', 'attention', 'recent'))
         if not count:
@@ -718,12 +900,18 @@ def emit(value, as_json=False, truncate=None, verbose=False):
                                           value['summary']['total'], value['summary']['ok']))
         for t in value['tasks']:
             print('  %s  %s  %s' % (t['task_id'], t['status'], t['title']))
+            if t.get('model'):
+                print('    model=%s (%s)' % (t['model'], t.get('model_source') or 'session'))
             if verbose:
                 print('    session=%s' % (t['session_id'] or '-'))
             text = t.get('error') or t.get('final_result')
             if text:
+                if isinstance(text, dict) and not verbose:
+                    text = str((text.get('data') or {}).get('message') or text.get('name') or text).splitlines()[0]
                 text = str(text)
                 print('    ' + (text[:truncate] + '…' if truncate and len(text) > truncate else text))
+            if t.get('error_hint'):
+                print('    ' + t['error_hint'])
         if value.get('pending_commands'):
             print('  尚有 %s 条控制指令等待确认' % len(value['pending_commands']))
     else:
@@ -737,8 +925,13 @@ def main(argv=None):
         return worker(argv[1])
     if not argv or argv in (['--help'], ['-h']):
         print(HELP)
+        try:
+            emit(list_models(os.getcwd()))
+        except (ValueError, OSError, RuntimeError) as e:
+            print('模型列表获取失败: ' + str(e), file=sys.stderr)
+            return 2
         return 0
-    command = argv.pop(0) if argv[0] in ('start', 'run', 'list', 'status', 'wait', 'send', 'cancel', 'result') else 'start'
+    command = argv.pop(0) if argv[0] in ('start', 'run', 'list', 'models', 'status', 'wait', 'send', 'cancel', 'result') else 'start'
     parser = argparse.ArgumentParser(prog='de-run ' + command, description=HELP,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--json', action='store_true')
@@ -754,6 +947,8 @@ def main(argv=None):
         parser.add_argument('--max-parallel', type=int, default=6)
         parser.add_argument('--timeout', type=int, default=900)
         parser.add_argument('--wait', action='store_true')
+    elif command == 'models':
+        parser.add_argument('--dir', default=os.getcwd())
     elif command == 'list':
         parser.add_argument('--active', action='store_true')
         parser.add_argument('--recent', type=int, default=10)
@@ -777,6 +972,8 @@ def main(argv=None):
                 if args.wait:
                     print('已启动 ' + result['run_id'], file=sys.stderr)
                     result, code = wait(result['run_id'])
+        elif command == 'models':
+            result = list_models(args.dir)
         elif command == 'list':
             result = list_tasks(args.active, args.recent, args.run)
             code = 1 if result['errors'] else 0

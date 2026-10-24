@@ -12,8 +12,14 @@ Install DevEco Code, complete `deveco auth login`, and make `deveco` available o
 python3 scripts/de-run.py --help
 ln -s "$(pwd)/scripts/de-run.py" ~/.local/bin/de-run
 
+# Bare invocation or --help shows help followed by live models and the default
+de-run
+
 # start/run/no subcommand are equivalent: return immediately
 de-run --dir /path/to/project --prompt 'Analyze the architecture; cite files' --json
+
+# List models from connected providers without submitting a model task
+de-run models --dir /path/to/project --json
 
 # Discover managed tasks
 de-run list
@@ -53,6 +59,7 @@ de-run --dir /path/to/project --prompt 'Analyze' --wait --json
 | `cancel TASK` | Clear pending prompts and confirm that active work has stopped |
 | `result ID` | Read durable reports and turn history; exit 2 if not ready |
 | `--sessions [N]` | Read historical sessions from DevEco SQLite |
+| `models [--dir PATH]` | Start a temporary local service and list models from connected providers for that directory; create no session or prompt |
 
 Human output emphasizes task IDs and hides session IDs by default. Use `--verbose` for session details; JSON retains the complete mapping. `--sessions` still shows session IDs because it explicitly queries DevEco history.
 
@@ -74,7 +81,17 @@ de-run --dir /path/A --session ses_example --prompt 'Continue'
 de-run --dir /path/A --prompt 'Analyze' --model provider/model
 ```
 
-Task JSON is an array or `{"tasks": [...]}`; each item supports `dir`, `prompt`, optional `title` and `session`. Resumed session directories must match. Without `--model`, DevEco's default/session configuration is used.
+Task JSON is an array or `{"tasks": [...]}`; each item supports `dir`, `prompt`, optional `title` and `session`. Resumed session directories must match. Without `--model`, de-run selects and explicitly submits a model automatically.
+
+### Automatic model selection
+
+Bare `de-run` and `de-run --help` display help followed by live models for the current working directory, marking the selected default. Discovery creates no session or model request. If discovery fails, help remains visible, the reason is printed, and the command exits with code 2. `de-run models --dir /path/A --json` includes `default_model` and `default_source` for new tasks.
+
+Explicit `--model` takes priority. Otherwise, selection considers only connected catalog entries: previous task/session model, default project agent's model, project `model` setting, provider defaults (preferring `deveco`), then the first sorted model ID (also preferring `deveco`). Session models may be recovered from recent messages. Unavailable preferences fall through to the next choice. Selection uses each task's directory; the worker caches that directory's catalog and configuration for its lifetime without changing DevEco configuration.
+
+The selected model is explicitly included in `prompt_async`, and `model`/`model_source` are saved in the task and turn history. `send` preserves the session model. The asynchronous startup receipt may still be `queued`; `status` exposes the automatic selection once the worker prepares submission. `provider_default` is a provider's own marker; the top-level `default_model` is de-run's selected default. With no connected models, tasks fail before submitting a prompt. Actual calls still depend on account permissions, connectivity, and quotas.
+
+Explicit model submission bypasses DevEco 0.2.4's faulty default-selection path, which can raise `ProviderNoProvidersError` even when logged in and models are listed. HTTP 204 from `prompt_async` only acknowledges submission: other failures can occur before any user or assistant message exists. de-run subscribes to `session.error` before each submission, preserves the original error in the task and its history, marks the turn `failed`, and adds an actionable `error_hint`.
 
 - `--max-parallel N`: per-batch limit, default and maximum 6; not an account-wide rate limiter.
 - Startup `--timeout SEC`: execution deadline per turn, default 900; actively aborts on expiry.
@@ -87,6 +104,8 @@ Tasks progress through `queued`, `running`, and terminal `ok`, `failed`, `incomp
 
 JSON includes `run_id`, `worker_alive`, `summary`, `pending_commands`, and `tasks`. Task records include IDs, status, round, actions, tokens, latest text, errors, pending prompts, and per-turn history. Current metrics belong to the current/latest turn; completed and interrupted turns remain in `history`. Only error-free `stop` with final text counts as `ok`; a length cutoff is `incomplete`.
 
+`tokens` sums assistant model calls within the current turn, including tool loops and cache accounting. Turns are separated by `parentID`; the number is neither a cross-turn total, a single context length, nor a billing amount. A continuously idle session with no complete reply is aborted and marked `incomplete` after 30 seconds; busy/retry execution is unaffected by that idle deadline. A disconnected error stream triggers a confirmed abort and explicit failure, or `orphaned` when stopping cannot be confirmed.
+
 | Code | Meaning |
 |---|---|
 | 0 | Request succeeded; wait/result require all selected tasks to succeed |
@@ -97,11 +116,11 @@ JSON includes `run_id`, `worker_alive`, `summary`, `pending_commands`, and `task
 
 ## Architecture and limitations
 
-Each batch has a detached worker, a private DevEco serve process, SQLite task/command/history storage, and ordered control commands. The worker polls session state/messages; it does not depend on CLI attach. Services are reclaimed when all batch tasks finish. Each server binds to 127.0.0.1 with a per-process random password held only in worker memory and the server environment.
+Each batch has a detached worker, a private DevEco serve process, SQLite task/command/history storage, and ordered control commands. The worker polls session state/messages and confirms a per-turn error-event subscription before submitting work. Services are reclaimed when all batch tasks finish. Each server binds to 127.0.0.1 with a per-process random password held only in worker memory and the server environment.
 
 Worker and session file locks coordinate de-run processes. Other DevEco clients can bypass these locks. No automatic worktree creation or file-write isolation is provided; callers must coordinate concurrent edits. New sessions automatically allow tools, matching the former `--auto` behavior; existing sessions retain their permissions. Prompts cannot enforce read-only execution.
 
-`DE_RUN_HOME` selects storage, default `~/.local/share/de-run`. It contains prompts and reports; manage it as project data. Logs are `<home>/<run_id>/worker.log` and `serve.log`. State survives the caller exiting, but automatic machine-reboot recovery is not provided. Killing a worker forcibly may leave DevEco/tool processes running. Multiple batches share account quotas; automatic rate limiting/retries are not implemented.
+`DE_RUN_HOME` selects storage, default `~/.local/share/de-run`. It contains prompts and reports; manage it as project data. Worker logs and server stdout are `<home>/<run_id>/worker.log` and `serve.log`; DevEco 0.2.4 runtime logs default to `~/.local/share/deveco/log/deveco.log`. Execution errors are also preserved directly in task results. State survives the caller exiting, but automatic machine-reboot recovery is not provided. Killing a worker forcibly may leave DevEco/tool processes running. Multiple batches share account quotas; automatic rate limiting/retries are not implemented.
 
 ## Tests
 

@@ -15,6 +15,13 @@ import uuid
 root = Path(os.environ['FAKE_DEVECO_HOME'])
 root.mkdir(exist_ok=True)
 mutex = threading.RLock()
+subscribers = []
+
+
+def publish(directory, payload):
+    for d, inbox in subscribers:
+        if d == directory:
+            inbox.put(payload)
 
 
 def event(kind, **kw):
@@ -28,6 +35,11 @@ def load(sid):
 
 def save(s):
     (root / (s['id'] + '.json')).write_text(json.dumps(s))
+
+
+def fixture(directory, name, default):
+    path = Path(directory) / (name + '.fixture.json')
+    return json.loads(path.read_text()) if path.is_file() else default
 
 
 def update(s):
@@ -59,6 +71,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
         directory = urllib.parse.parse_qs(parsed.query).get('directory', [''])[0]
+        if path == '/event':
+            self.stream_events(directory)
+            return
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or '{}')
         code, result = 200, None
         with mutex:
@@ -66,7 +81,17 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/doc':
                     result = {'paths': {k: {} for k in ('/session', '/session/status',
                         '/session/{sessionID}/prompt_async', '/session/{sessionID}/abort',
-                        '/session/{sessionID}/message')}}
+                        '/session/{sessionID}/message', '/event')}}
+                elif path == '/provider':
+                    time.sleep(fixture(directory, 'provider-delay', 0))
+                    result = fixture(directory, 'provider', dict(connected=['deveco'], default={'deveco': 'GLM-5.3'},
+                                  all=[dict(id='deveco', models={'GLM-5.3': {'name': 'GLM 5.3'},
+                                                               'GLM-5.1': {'name': 'GLM 5.1'}}),
+                                       dict(id='disconnected', models={'hidden': {}})]))
+                elif path == '/config':
+                    result = fixture(directory, 'config', {})
+                elif path == '/agent':
+                    result = fixture(directory, 'agent', [{'name': 'build'}])
                 elif path == '/session' and method == 'POST':
                     sid = 'ses_' + uuid.uuid4().hex
                     result = dict(id=sid, directory=directory, messages=[], busy=False)
@@ -93,9 +118,22 @@ class Handler(BaseHTTPRequestHandler):
                             text = body['parts'][0]['text']
                             s.update(busy=True, until=time.time() + (12 if 'SLOW' in text else .35),
                                      mid=body['messageID'], text=text)
-                            s['messages'].append(dict(info=dict(role='user', id=s['mid']), parts=body['parts']))
+                            if body.get('model'):
+                                s['model'] = {'providerID': body['model']['providerID'], 'id': body['model']['modelID']}
+                            s['messages'].append(dict(info=dict(role='user', id=s['mid'], model=body.get('model')),
+                                                      parts=body['parts']))
                             save(s)
                             event('prompt', sid=sid, text=text, body=body)
+                            if 'EARLY_PROVIDER' in text:
+                                # Real DevEco fails before creating even the user message.
+                                s['messages'].pop()
+                                s['busy'] = False
+                                save(s)
+                                publish(directory, dict(type='session.error', properties=dict(
+                                    sessionID=sid, error={'name': 'UnknownError', 'data': {
+                                        'message': 'ProviderNoProvidersError: no default provider'}})))
+                            elif 'STREAM_LOST' in text:
+                                publish(directory, None)
                             code = 204
                     elif chunks[2] == 'abort':
                         event('abort', sid=sid)
@@ -121,6 +159,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def stream_events(self, directory):
+        import queue
+        inbox = queue.Queue()
+        subscriber = (directory, inbox)
+        with mutex:
+            subscribers.append(subscriber)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.end_headers()
+        try:
+            payload = dict(type='server.connected', properties={})
+            while payload is not None:
+                # Exercise multi-line SSE data and CRLF framing, not just JSON lines.
+                data = json.dumps(payload, indent=2)
+                self.wfile.write(('\r\n'.join('data: ' + line for line in data.splitlines()) +
+                                  '\r\n\r\n').encode())
+                self.wfile.flush()
+                try:
+                    payload = inbox.get(timeout=.2)
+                except queue.Empty:
+                    payload = dict(type='server.heartbeat', properties={})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            with mutex:
+                subscribers.remove(subscriber)
+            self.close_connection = True
 
     def do_GET(self): self.handle_request('GET')
     def do_POST(self): self.handle_request('POST')

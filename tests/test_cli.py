@@ -139,6 +139,105 @@ class CLIIntegration(unittest.TestCase):
         self.assertEqual(result['tasks'][0]['status'], 'failed')
         self.assertEqual(self.call('result', tid, check=False)[0], 1)
 
+    def test_provider_error_before_any_message_is_reported_promptly(self):
+        tid = self.start('EARLY_PROVIDER')['tasks'][0]['task_id']
+        code, result = self.call('wait', tid, '--timeout', '3', check=False)
+        self.assertEqual(code, 1, result)
+        task = result['tasks'][0]
+        self.assertEqual(task['status'], 'failed')
+        self.assertIn('ProviderNoProvidersError', json.dumps(task['error']))
+        self.assertIn('de-run models', task['error_hint'])
+        self.assertEqual(task['history'][0]['error'], task['error'])
+        self.assertEqual(self.call('result', tid, check=False)[0], 1)
+        # A new turn in the same session must not inherit the prior error event.
+        self.call('send', tid, 'FAST recovered')
+        recovered = self.call('wait', tid, '--timeout', '5')[1]['tasks'][0]
+        self.assertIsNone(recovered['error'])
+        self.assertIsNone(recovered['error_hint'])
+        self.assertEqual(recovered['session_id'], task['session_id'])
+
+    def test_error_stream_loss_aborts_instead_of_hiding_failures(self):
+        tid = self.start('SLOW STREAM_LOST')['tasks'][0]['task_id']
+        code, result = self.call('wait', tid, '--timeout', '3', check=False)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result['tasks'][0]['status'], 'failed')
+        self.assertIn('事件流', result['tasks'][0]['error'])
+        self.assertTrue(self.events('abort'))
+
+    def test_models_lists_connected_providers_without_submitting_work(self):
+        result = self.call('models', '--dir', str(self.workspace))[1]
+        self.assertEqual(result['models'], [dict(model='deveco/GLM-5.1', name='GLM 5.1', provider_default=False),
+                                           dict(model='deveco/GLM-5.3', name='GLM 5.3',
+                                                provider_default=True)])
+        self.assertEqual(result['default_model'], 'deveco/GLM-5.3')
+        self.assertEqual(result['default_source'], 'provider_default')
+        self.assertEqual(result['dir'], str(self.workspace.resolve()))
+        self.assertFalse(self.events('create'))
+        self.assertFalse(self.events('prompt'))
+
+    def test_bare_invocation_and_help_show_live_default_without_submitting_work(self):
+        for args in ([], ['--help']):
+            p = subprocess.run(CLI + args, env=self.env, cwd=self.workspace, text=True,
+                               capture_output=True, timeout=10)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn('现有模型列表', p.stdout)
+            self.assertIn('deveco/GLM-5.3（默认）', p.stdout)
+            self.assertIn('deveco/GLM-5.1', p.stdout)
+            self.assertNotIn('disconnected/hidden', p.stdout)
+        self.assertFalse(self.events('create'))
+        self.assertFalse(self.events('prompt'))
+
+    def test_unspecified_model_is_explicitly_submitted_and_persisted(self):
+        tid = self.start()['tasks'][0]['task_id']
+        result = self.call('wait', tid, '--timeout', '5')[1]['tasks'][0]
+        self.assertEqual(self.events('prompt')[0]['body']['model'], {'providerID': 'deveco', 'modelID': 'GLM-5.3'})
+        self.assertEqual(result['model'], 'deveco/GLM-5.3')
+        self.assertEqual(result['model_source'], 'provider_default')
+        self.assertEqual(result['history'][0]['model'], result['model'])
+
+    def test_project_config_overrides_provider_default_and_session_model_is_reused(self):
+        (self.workspace / 'config.fixture.json').write_text(json.dumps({'model': 'deveco/GLM-5.1'}))
+        self.assertEqual(self.call('models', '--dir', str(self.workspace))[1]['default_model'], 'deveco/GLM-5.1')
+        tid = self.start()['tasks'][0]['task_id']
+        first = self.call('wait', tid, '--timeout', '5')[1]['tasks'][0]
+        self.assertEqual(first['model'], 'deveco/GLM-5.1')
+        self.assertEqual(first['model_source'], 'config')
+        # A separate batch resuming a native session must honor the session model.
+        (self.workspace / 'config.fixture.json').write_text(json.dumps({'model': 'deveco/GLM-5.3'}))
+        deadline = time.monotonic() + 5
+        while self.call('status', tid)[1]['worker_alive'] and time.monotonic() < deadline:
+            time.sleep(.1)
+        resumed = self.start(session=first['session_id'])['tasks'][0]['task_id']
+        result = self.call('wait', resumed, '--timeout', '5')[1]['tasks'][0]
+        self.assertEqual(result['model'], 'deveco/GLM-5.1')
+        self.assertEqual(result['model_source'], 'session')
+
+    def test_no_connected_models_fails_before_submitting_prompt(self):
+        (self.workspace / 'provider.fixture.json').write_text(json.dumps({'all': [], 'connected': [], 'default': {}}))
+        tid = self.start()['tasks'][0]['task_id']
+        code, result = self.call('wait', tid, '--timeout', '5', check=False)
+        self.assertEqual(code, 1)
+        self.assertIn('没有已连接的可用模型', result['tasks'][0]['error'])
+        self.assertFalse(self.events('prompt'))
+
+    def test_model_discovery_tolerates_slow_project_initialization(self):
+        (self.workspace / 'provider-delay.fixture.json').write_text('6')
+        result = self.call('models', '--dir', str(self.workspace))[1]
+        self.assertEqual(result['default_model'], 'deveco/GLM-5.3')
+        self.assertFalse(self.events('prompt'))
+
+    def test_event_error_is_scoped_to_the_correct_session(self):
+        tasks = self.root / 'tasks.json'
+        tasks.write_text(json.dumps([dict(dir=str(self.workspace), prompt='EARLY_PROVIDER'),
+                                    dict(dir=str(self.workspace), prompt='FAST sibling')]))
+        started = self.call('--tasks', str(tasks))[1]
+        code, result = self.call('wait', started['run_id'], '--timeout', '5', check=False)
+        self.assertEqual(code, 1)
+        failed, ok = result['tasks']
+        self.assertEqual(failed['status'], 'failed')
+        self.assertEqual(ok['status'], 'ok')
+        self.assertIsNone(ok['error'])
+
     def test_length_is_incomplete(self):
         tid = self.start('LENGTH')['tasks'][0]['task_id']
         code, result = self.call('wait', tid, '--timeout', '10', check=False)
@@ -212,6 +311,98 @@ class CLIIntegration(unittest.TestCase):
         self.assertTrue(self.events('abort'))
 
 
+class ModelSelectionTest(unittest.TestCase):
+    def setUp(self):
+        self.models = [dict(model='custom/other', provider_default=True),
+                       dict(model='deveco/GLM-5.1', provider_default=False),
+                       dict(model='deveco/GLM-5.3', provider_default=True)]
+
+    def test_session_model_precedes_agent_and_project_model(self):
+        config = {'model': 'custom/other', 'default_agent': 'plan'}
+        agents = [dict(name='plan', model={'providerID': 'deveco', 'modelID': 'GLM-5.3'})]
+        result = module.choose_model(self.models, config, agents, {'providerID': 'deveco', 'id': 'GLM-5.1'})
+        self.assertEqual(result, ('deveco/GLM-5.1', 'session'))
+        self.assertEqual(module.choose_model(self.models, config, agents), ('deveco/GLM-5.3', 'agent'))
+
+    def test_unavailable_preferences_fall_back_to_connected_provider_default(self):
+        self.assertEqual(module.choose_model(self.models, {'model': 'disconnected/hidden'}, [], 'gone/model'),
+                         ('deveco/GLM-5.3', 'provider_default'))
+
+    def test_fallback_is_deterministic_without_a_provider_default(self):
+        for row in self.models:
+            row['provider_default'] = False
+        self.assertEqual(module.choose_model(list(reversed(self.models)), {}, []),
+                         ('deveco/GLM-5.1', 'first_available'))
+
+    def test_native_session_recovers_model_from_messages_when_metadata_is_absent(self):
+        runner = module.Runner(None, None, None, {})
+        runner.catalogs['/workspace'] = (self.models, {}, [])
+        runner.api = unittest.mock.Mock(return_value=[
+            dict(info=dict(role='user', model={'providerID': 'deveco', 'modelID': 'GLM-5.1'})),
+            dict(info=dict(role='assistant', id='msg_reply'))])
+        self.assertEqual(runner.resolve_model({'dir': '/workspace', 'session_id': 'ses_test', 'model': 'gone/model'}, {}),
+                         ('deveco/GLM-5.1', 'session'))
+
+
+class PollingTest(unittest.TestCase):
+    def setUp(self):
+        self.runner = module.Runner(None, None, None, {'timeout': 900})
+        self.runner.persist = unittest.mock.Mock()
+        self.runner.release_session = unittest.mock.Mock()
+        self.runner.abort = unittest.mock.Mock()
+        self.events = unittest.mock.Mock()
+        self.events.get_error.return_value = None
+        self.runner.events['task_test'] = self.events
+        self.task = dict(task_id='task_test', session_id='ses_test', message_id='msg_test',
+                         started_at=990, idle_since=None, round=1, history=[], pending=[], status='running')
+        self.state = {}
+        self.messages = []
+        self.runner.api = unittest.mock.Mock(side_effect=lambda t, method, route:
+            self.state if route == '/session/status' else self.messages)
+
+    def poll(self):
+        with unittest.mock.patch.object(module.time, 'time', return_value=1000):
+            self.runner.poll(self.task)
+
+    def test_startup_idle_has_grace_and_busy_resets_it(self):
+        self.poll()
+        self.assertEqual(self.task['status'], 'running')
+        self.assertEqual(self.task['idle_since'], 1000)
+        self.runner.abort.assert_not_called()
+        self.state['ses_test'] = {'type': 'busy'}
+        self.poll()
+        self.assertIsNone(self.task['idle_since'])
+
+    def test_idle_without_messages_or_error_cannot_run_forever(self):
+        self.task['idle_since'] = 1000 - module.IDLE_GRACE - 1
+        self.poll()
+        self.runner.abort.assert_called_once()
+        self.assertEqual(self.task['status'], 'incomplete')
+        self.assertIn('没有完整回复', self.task['error'])
+        self.assertEqual(self.task['history'][0]['status'], 'incomplete')
+
+    def test_busy_error_preserves_cause_across_confirmed_abort_and_holds_queue(self):
+        self.state['ses_test'] = {'type': 'busy'}
+        error = {'name': 'UnknownError', 'data': {'message': 'ProviderNoProvidersError'}}
+        self.events.get_error.return_value = error
+        self.task['pending'] = ['must not auto-run']
+        self.runner.abort.side_effect = lambda t: t.update(error='abort result')
+        self.poll()
+        self.runner.abort.assert_called_once()
+        self.assertEqual(self.task['status'], 'failed')
+        self.assertEqual(self.task['error'], error)
+        self.assertEqual(self.task['pending'], ['must not auto-run'])
+
+    def test_message_error_is_not_masked_by_a_disconnected_stream(self):
+        error = {'name': 'APIError', 'data': {'message': 'provider failed'}}
+        self.messages.append(dict(info=dict(role='assistant', parentID='msg_test', error=error), parts=[]))
+        self.events.get_error.side_effect = RuntimeError('stream disconnected')
+        self.poll()
+        self.assertEqual(self.task['status'], 'failed')
+        self.assertEqual(self.task['error'], error)
+        self.events.get_error.assert_not_called()
+
+
 class SummaryTest(unittest.TestCase):
     def test_lost_worker_with_unacknowledged_control_is_terminal_failure(self):
         result = dict(worker_alive=False, pending_commands=[{'kind': 'send'}],
@@ -230,6 +421,12 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(result['tokens'], 7)
         self.assertEqual(result['actions'], {'read': 1})
         self.assertEqual(result['final_result'], 'done')
+
+    def test_token_fallback_includes_cache_but_never_prior_turns(self):
+        messages = [dict(info=dict(role='assistant', parentID='old', tokens={'total': 999}), parts=[]),
+                    dict(info=dict(role='assistant', parentID='new', tokens={
+                        'input': 10, 'output': 2, 'reasoning': 3, 'cache': {'read': 100, 'write': 20}}), parts=[])]
+        self.assertEqual(module.round_result(messages, 'new')['tokens'], 135)
 
 
 if __name__ == '__main__':
